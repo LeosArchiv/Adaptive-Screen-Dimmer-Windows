@@ -83,11 +83,15 @@ class Smoother:
         self.settled = True
         self._lower_since = 0.0
 
-    def step(self, target: float, dt: float) -> float:
-        """Advance by ``dt`` seconds toward ``target`` and return the new value."""
+    def step(self, target: float, dt: float, skip_hold: bool = False) -> float:
+        """Advance by ``dt`` seconds toward ``target`` and return the new value.
+
+        ``skip_hold`` starts brightening at once (used when dimming is switched off on purpose).
+        """
         dt = max(0.0, min(dt, 1.0))
         diff = target - self.value
-        if self.settled and abs(diff) < self.deadband:
+        # The deadband never keeps a faint overlay alive: reaching 0 hides the window entirely.
+        if self.settled and abs(diff) < self.deadband and not (target == 0 and self.value > 0):
             self._lower_since = 0.0
             return self.value
 
@@ -96,7 +100,7 @@ class Smoother:
             tau = max(self.attack, 1e-3)
         else:
             self._lower_since += dt
-            if self._lower_since < self.hold:
+            if self._lower_since < self.hold and not skip_hold:
                 return self.value
             tau = max(self.release, 1e-3)
         # Exponential ease-out, plus a minimum speed so the tail ends in about 4 * tau

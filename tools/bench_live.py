@@ -30,7 +30,7 @@ from dimmer import winapi  # noqa: E402
 from dimmer.engine import Engine  # noqa: E402
 from dimmer.settings import Settings  # noqa: E402
 
-CALM_S = 6.0
+CALM_S = 8.0
 WHITE_S = 2.5
 
 

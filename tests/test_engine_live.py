@@ -52,3 +52,26 @@ def test_switch_monitors_at_runtime(engine: Engine) -> None:
     engine.update_settings(Settings(max_opacity=0, hotkey=False, monitors=all_ids[-1:]))
     time.sleep(0.4)
     assert [m.device for m in engine.snapshot().monitors] == all_ids[-1:]
+
+
+def test_transient_error_does_not_kill_engine(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    import dimmer.engine as engine_mod
+
+    real = engine_mod.list_monitors
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("monitor vanished during enumeration")
+        return real()
+
+    monkeypatch.setattr(engine_mod, "list_monitors", flaky)
+    engine._monitors_dirty = True  # force a refresh on the next round
+    engine._wake()
+    time.sleep(1.0)
+    st = engine.snapshot()
+    assert calls["n"] >= 2
+    assert engine.is_alive() and st.running
+    assert st.error is None  # cleared after the next good round
+    assert len(st.monitors) == 1

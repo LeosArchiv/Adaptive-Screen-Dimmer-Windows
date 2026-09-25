@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import dataclasses
 import logging
 import logging.handlers
 import sys
@@ -21,9 +22,12 @@ ERROR_ALREADY_EXISTS = 183
 
 def _single_instance() -> object | None:
     """Returns a mutex handle, or None when another instance already runs."""
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
         return None
     return handle
@@ -70,8 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     from .tray import TrayIcon
 
     settings = settings_mod.load()
-    if args.paused:
-        settings.start_paused = True
+    # --paused applies to this run only and must not end up in the saved settings
+    engine_settings = dataclasses.replace(settings, start_paused=True) if args.paused else settings
     log.info(
         "Start – Abdunkeln ab %d, volle Stärke ab %d, max. %d %%",
         settings.start,
@@ -79,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         round(settings.max_opacity / 255 * 100),
     )
 
-    engine = Engine(settings)
+    engine = Engine(engine_settings)
     engine.start()
     tray = TrayIcon()
     tray.start()

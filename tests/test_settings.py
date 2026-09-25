@@ -83,3 +83,16 @@ def test_wanted_devices_keeps_connected_choice() -> None:
 def test_wanted_devices_falls_back_when_choice_unplugged() -> None:
     mons = [_mon("a", True)]
     assert wanted_devices(["gone"], mons) == ["a"]
+
+
+def test_hostile_values_do_not_crash(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    p.write_text(
+        '{"start": Infinity, "full": NaN, "attack": ["x"], "hotkey": "false", "close_to_tray": 0}',
+        encoding="utf-8",
+    )
+    s = load(p)
+    assert s.start == 0 and s.full == 1
+    assert s.attack == Settings().attack
+    assert s.hotkey is True  # string "false" is not trusted, default kept
+    assert s.close_to_tray is True

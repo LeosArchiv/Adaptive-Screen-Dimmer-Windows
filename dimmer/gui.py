@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import logging
 import queue
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -32,6 +33,7 @@ FONT_TITLE = ("Segoe UI Semibold", 13)
 LOG_LINES = 300
 POLL_MS = 100
 SAVE_DELAY_MS = 600
+STALL_S = 3.0
 
 
 class QueueLogHandler(logging.Handler):
@@ -268,14 +270,20 @@ class DimmerApp:
             return
         start = self.start_var.get()
         full = self.full_var.get()
-        if full <= start:  # keep the pair consistent while dragging either slider
-            full = min(255, start + 1)
-            self.full_var.set(full)
+        if full <= start:
+            # Keep the pair consistent by pushing the *other* slider, so the one being dragged
+            # never jumps back under the mouse.
+            if start != self.settings.start:
+                full = min(255, start + 1)
+                self.full_var.set(full)
+            else:
+                start = max(0, full - 1)
+                self.start_var.set(start)
         new = dataclasses.replace(
             self.settings,
             start=start,
             full=full,
-            max_opacity=round(self.max_var.get() / 100 * 255),
+            max_opacity=self._max_opacity_from_widget(),
             attack=self.attack_var.get(),
             release=self.release_var.get(),
             excluded_apps=list(self.exc_list.get(0, tk.END)),
@@ -285,6 +293,12 @@ class DimmerApp:
             start_minimized=self.start_minimized_var.get(),
         ).normalized()
         self._apply(new)
+
+    def _max_opacity_from_widget(self) -> int:
+        pct = self.max_var.get()
+        if round(self.settings.max_opacity / 255 * 100) == pct:
+            return self.settings.max_opacity  # unchanged: avoid drift from percent rounding
+        return round(pct / 100 * 255)
 
     def _apply(self, new: Settings) -> None:
         if new == self.settings:
@@ -341,6 +355,8 @@ class DimmerApp:
         if not chosen:
             self._monitor_rows[device][0].set(True)  # at least one monitor stays active
             return
+        # Monitors that are unplugged right now (laptop on the road) keep their choice.
+        chosen += [d for d in self.settings.monitors if d not in self._monitor_rows]
         self._apply(Settings(**{**vars(self.settings), "monitors": chosen}).normalized())
 
     def _identify(self) -> None:
@@ -470,8 +486,11 @@ class DimmerApp:
             meter.show(m.brightness if m else 0.0, self.settings.start, self.settings.full)
             pct.config(text=f"{round(m.opacity / 255 * 100)} %" if m else "–")
 
+        stalled = st.running and st.heartbeat and time.monotonic() - st.heartbeat > STALL_S
         if st.error:
             text, color = f"Fehler: {st.error}", ERR
+        elif stalled:
+            text, color = "Reagiert nicht", ERR
         elif not st.running:
             text, color = "Gestoppt", ERR
         elif st.paused_reason == "user":

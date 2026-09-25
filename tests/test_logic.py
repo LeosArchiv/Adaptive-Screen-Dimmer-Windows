@@ -138,6 +138,23 @@ def test_no_flicker_on_constant_bright_content() -> None:
     assert set(tail) == {240}
 
 
+def test_deadband_never_keeps_faint_overlay() -> None:
+    sm = Smoother()
+    sm.reset(2.0)
+    values = run(sm, [0] * 40)
+    assert values[-1] == 0
+
+
+def test_skip_hold_fades_out_at_once_and_smoothly() -> None:
+    sm = Smoother(release=RELEASE_PRESETS["Normal"])
+    sm.reset(240)
+    values = [sm.step(0, 0.05, skip_hold=True) for _ in range(60)]
+    assert values[0] < 240
+    assert all(b <= a for a, b in zip(values, values[1:]))
+    assert max(a - b for a, b in zip([240.0] + values, values)) < 40  # no visible stair steps
+    assert values[-1] == 0
+
+
 def test_large_dt_is_clamped() -> None:
     sm = Smoother()
     assert sm.step(240, 100.0) == 240  # clamped to 1 s, still finite and at target

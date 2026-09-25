@@ -105,8 +105,21 @@ class Monitor:
         return (self.left, self.top, self.width, self.height)
 
 
-def _stable_id(gdi_name: str) -> str:
-    """Device interface path of the first monitor on this output, e.g. \\\\?\\DISPLAY#HWP2949#..."""
+_id_cache: dict[tuple[str, tuple[int, int, int, int]], str] = {}
+
+
+def _stable_id(gdi_name: str, rect: tuple[int, int, int, int]) -> str:
+    """Device interface path of the first monitor on this output, e.g. \\\\?\\DISPLAY#HWP2949#...
+
+    Cached per output name and rectangle: the periodic check then costs no driver query.
+    """
+    key = (gdi_name, rect)
+    if key not in _id_cache:
+        _id_cache[key] = _query_stable_id(gdi_name)
+    return _id_cache[key]
+
+
+def _query_stable_id(gdi_name: str) -> str:
     try:
         dev = win32api.EnumDisplayDevices(gdi_name, 0, 1)  # EDD_GET_DEVICE_INTERFACE_NAME
         if dev.DeviceID:
@@ -125,7 +138,7 @@ def list_monitors() -> list[Monitor]:
         gdi_name = str(info["Device"])
         result.append(
             Monitor(
-                device=_stable_id(gdi_name),
+                device=_stable_id(gdi_name, (left, top, right, bottom)),
                 gdi_name=gdi_name,
                 left=left,
                 top=top,
@@ -155,6 +168,9 @@ class Sampler:
         self._own_dc = source_dc is None
         self.src_dc = user32.GetDC(None) if source_dc is None else source_dc
         self.mem_dc = gdi32.CreateCompatibleDC(self.src_dc)
+        if not self.src_dc or not self.mem_dc:
+            self.close()
+            raise OSError("could not create a device context for screen capture")
         self._size: tuple[int, int] = (0, 0)
         self._bitmap = None
         self._old = None

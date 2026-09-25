@@ -42,25 +42,25 @@ class Settings:
         s.full = _clamp(s.full, s.start + 1, 255)
         s.max_opacity = _clamp(s.max_opacity, 0, 240)
         s.interval_ms = _clamp(s.interval_ms, 16, 500)
-        if s.attack not in ATTACK_PRESETS:
+        if not isinstance(s.attack, str) or s.attack not in ATTACK_PRESETS:
             s.attack = Settings.attack
-        if s.release not in RELEASE_PRESETS:
+        if not isinstance(s.release, str) or s.release not in RELEASE_PRESETS:
             s.release = Settings.release
         monitors = s.monitors if isinstance(s.monitors, list) else []
         s.monitors = [m for m in monitors if isinstance(m, str)]
         apps = s.excluded_apps if isinstance(s.excluded_apps, list) else []
         s.excluded_apps = sorted({str(a).strip().lower() for a in apps if str(a).strip()})
-        s.hotkey = bool(s.hotkey)
-        s.start_paused = bool(s.start_paused)
-        s.close_to_tray = bool(s.close_to_tray)
-        s.start_minimized = bool(s.start_minimized)
+        defaults = Settings()
+        for name in ("hotkey", "start_paused", "close_to_tray", "start_minimized"):
+            if not isinstance(getattr(s, name), bool):  # "false" as a string must not mean True
+                setattr(s, name, getattr(defaults, name))
         return s
 
 
 def _clamp(value: Any, lo: int, hi: int) -> int:
     try:
         v = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         v = lo
     return max(lo, min(hi, v))
 

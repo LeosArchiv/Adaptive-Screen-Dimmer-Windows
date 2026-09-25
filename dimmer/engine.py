@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import math
 import queue
 import threading
 import time
@@ -88,7 +89,7 @@ IDLE_FACTOR = 3.0
 IDLE_INTERVAL_MAX_S = 0.25
 CALM_THRESHOLD = 1.5  # brightness change (0..255) that counts as "something moved"
 EVENT_DELAY_S = 0.03
-EVENT_MIN_GAP_S = 0.025
+MIN_SLEEP_S = 0.005
 
 
 @dataclass
@@ -110,6 +111,7 @@ class Status:
     monitors: list[MonitorStatus] = field(default_factory=list)
     error: str | None = None
     hotkey_ok: bool = False
+    heartbeat: float = 0.0  # time.monotonic() of the last engine loop round
 
 
 class _Slot:
@@ -119,9 +121,25 @@ class _Slot:
         self.monitor = monitor
         self.index = index
         self.overlay = Overlay(monitor)
+        # One capture buffer per monitor: a shared one would be reallocated every round when
+        # monitors differ in size. A fresh screen DC also follows display mode changes.
+        self.sampler = Sampler()
         self.smoother = Smoother()
         self.level = 0.0
         self.target = 0.0
+        self.alpha_changed = False
+
+    def update_geometry(self, monitor: Monitor, index: int) -> None:
+        self.index = index
+        if monitor != self.monitor:
+            self.overlay.move(monitor)
+            self.monitor = monitor
+            self.sampler.close()
+            self.sampler = Sampler()
+
+    def close(self) -> None:
+        self.overlay.destroy()
+        self.sampler.close()
 
 
 def wanted_devices(chosen: list[str], monitors: list[Monitor]) -> list[str]:
@@ -190,6 +208,7 @@ class Engine(threading.Thread):
                 monitors=[MonitorStatus(**vars(m)) for m in s.monitors],
                 error=s.error,
                 hotkey_ok=s.hotkey_ok,
+                heartbeat=s.heartbeat,
             )
 
     def monitors(self) -> list[Monitor]:
@@ -206,74 +225,93 @@ class Engine(threading.Thread):
     # ---- engine thread ---------------------------------------------------------------
     def run(self) -> None:
         self._thread_id = threading.get_native_id()
-        sampler: Sampler | None = None
         try:
             overlay_mod.set_message_hook(self._on_window_message)
-            sampler = Sampler()
             self._register_hotkey()
             self._install_hook()
             self._refresh_monitors()
             with self._lock:
                 self._status.running = True
             self._ready.set()
-            self._loop(sampler)
+            self._loop()
         except Exception as e:  # report instead of dying silently
             log.exception("Engine stopped because of an error")
             with self._lock:
                 self._status.error = f"{type(e).__name__}: {e}"
         finally:
             self._ready.set()
-            self._teardown(sampler)
+            self._teardown()
 
-    def _loop(self, sampler: Sampler) -> None:
+    def _loop(self) -> None:
         last = calm_since = time.perf_counter()
         next_tick = next_monitor_check = next_topmost = next_fg = 0.0
+        failures = 0
         while not self._stop_event.is_set():
-            self._pump()
-            self._run_commands()
-            if self._stop_event.is_set():
-                break
-            now = time.perf_counter()
-            if self._wake_now:
-                # New window / focus change: measure soon, but let it paint first and never
-                # measure more often than every EVENT_MIN_GAP_S.
-                self._wake_now = False
-                next_tick = min(next_tick, max(last + EVENT_MIN_GAP_S, now + EVENT_DELAY_S))
-            if self._monitors_dirty or now >= next_monitor_check:
-                self._monitors_dirty = False
-                self._refresh_monitors()
-                next_monitor_check = now + MONITOR_CHECK_S
-            if now >= next_fg:
-                self._check_foreground()
-                next_fg = now + FOREGROUND_CHECK_S
-
-            if now >= next_tick:
-                # Cap dt at one active interval: after a slow idle phase the ramp must still
-                # be gradual instead of jumping in a single step.
+            try:
+                self._pump()
+                self._run_commands()
+                if self._stop_event.is_set():
+                    break
+                now = time.perf_counter()
                 base = self._settings.interval_ms / 1000.0
-                if self._tick(sampler, min(now - last, base)):
+                if self._wake_now:
+                    # New window / focus / title change: leave the idle rate and measure soon,
+                    # after the window had a moment to paint, but never above the base rate.
+                    self._wake_now = False
                     calm_since = now
-                last = now
-                next_tick = now + self._current_interval(now - calm_since)
+                    next_tick = min(next_tick, max(last + base, now + EVENT_DELAY_S))
+                if self._monitors_dirty or now >= next_monitor_check:
+                    self._monitors_dirty = False
+                    self._refresh_monitors()
+                    next_monitor_check = now + MONITOR_CHECK_S
+                if now >= next_fg:
+                    self._check_foreground()
+                    next_fg = now + FOREGROUND_CHECK_S
 
-            if now >= next_topmost:
-                for slot in self._slots.values():
-                    slot.overlay.keep_on_top()
-                next_topmost = now + TOPMOST_REFRESH_S
+                if now >= next_tick:
+                    # Cap dt at two active intervals: after a slow idle phase the ramp must still
+                    # be gradual instead of jumping in a single step.
+                    if self._tick(min(now - last, 2 * base)):
+                        calm_since = now
+                    last = now
+                    # Measured from the end of the tick, so a slow capture can never turn the
+                    # loop into a busy spin.
+                    next_tick = max(now + self._current_interval(now - calm_since), time.perf_counter() + MIN_SLEEP_S)
 
-            wake_at = min(next_tick, next_fg)
-            self._wait(wake_at - time.perf_counter())
+                if now >= next_topmost:
+                    for slot in self._slots.values():
+                        slot.overlay.keep_on_top()
+                    next_topmost = now + TOPMOST_REFRESH_S
+                if failures:
+                    failures = 0
+                    with self._lock:
+                        self._status.error = None
+                self._wait(min(next_tick, next_fg) - time.perf_counter())
+            except Exception as e:
+                # A transient Win32 error (e.g. a monitor vanishing mid-enumeration) must not end
+                # the dimmer for the rest of the session: log, back off, rebuild, carry on.
+                failures += 1
+                log.exception("Fehler in der Messschleife (%d)", failures)
+                with self._lock:
+                    self._status.error = f"{type(e).__name__}: {e}"
+                self._monitors_dirty = True
+                self._stop_event.wait(min(2.0, 0.2 * failures))
+
+    def _any_moving(self) -> bool:
+        return any(not slot.smoother.settled for slot in self._slots.values())
 
     def _current_interval(self, calm_for: float) -> float:
         """Full rate while anything moves; a slower rate once every monitor has been still."""
         base = self._settings.interval_ms / 1000.0
+        if self._any_moving():
+            return base  # a running fade always gets full rate, or it would show as steps
         if self._paused or self._app_paused is not None:
             return max(base, IDLE_INTERVAL_MAX_S)
         if calm_for >= IDLE_AFTER_S:
             return min(max(base, base * IDLE_FACTOR), max(base, IDLE_INTERVAL_MAX_S))
         return base
 
-    def _tick(self, sampler: Sampler, dt: float) -> bool:
+    def _tick(self, dt: float) -> bool:
         """One measurement/update round. Returns True when something changed noticeably."""
         s = self._settings
         active = False
@@ -283,13 +321,17 @@ class Engine(threading.Thread):
                 slot.smoother.reset(0.0)  # user asked for it: off at once
             elif self._app_paused is not None:
                 slot.target = 0.0
-                slot.smoother.step(0.0, dt)  # fade out gently, no capture needed
+                slot.smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
+            elif not slot.overlay.excluded and slot.alpha_changed:
+                # Compensation fallback: the capture may still show the previous alpha (DWM
+                # presents a frame later), so skip measuring while the overlay is changing.
+                slot.smoother.step(slot.target, dt)
             else:
                 try:
                     m = slot.monitor
-                    level = brightness(sampler.grab(m.left, m.top, m.width, m.height))
+                    level = brightness(slot.sampler.grab(m.left, m.top, m.width, m.height))
                 except OSError as e:  # e.g. secure desktop (UAC, lock screen): keep last state
-                    log.debug("capture failed on %s: %s", slot.monitor.device, e)
+                    log.debug("capture failed on %s: %s", slot.monitor.gdi_name, e)
                     continue
                 if not slot.overlay.excluded:
                     level = compensate(level, slot.overlay.alpha)
@@ -298,7 +340,9 @@ class Engine(threading.Thread):
                 slot.level = level
                 slot.target = target_opacity(level, s.start, s.full, s.max_opacity)
                 slot.smoother.step(slot.target, dt)
-            slot.overlay.set_alpha(round(slot.smoother.value))
+            alpha = round(slot.smoother.value)
+            slot.alpha_changed = alpha != slot.overlay.alpha
+            slot.overlay.set_alpha(alpha)
             if not slot.smoother.settled:
                 active = True
         self._publish()
@@ -307,7 +351,7 @@ class Engine(threading.Thread):
     def _wait(self, seconds: float) -> None:
         if self._wake_now or self._stop_event.is_set():
             return
-        ms = max(0, int(seconds * 1000))
+        ms = max(0, math.ceil(seconds * 1000))
         if ms:
             user32.MsgWaitForMultipleObjects(0, None, False, ms, QS_ALLINPUT)
 
@@ -317,7 +361,10 @@ class Engine(threading.Thread):
             if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
                 self._set_paused(not self._paused)
                 if self.on_hotkey:
-                    self.on_hotkey()
+                    try:
+                        self.on_hotkey()
+                    except Exception:
+                        log.exception("Hotkey callback failed")
                 continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
@@ -383,19 +430,20 @@ class Engine(threading.Thread):
         wanted = set(wanted_devices(self._settings.monitors, monitors))
         by_device = {m.device: (i, m) for i, m in enumerate(monitors)}
         for device in list(self._slots):
-            slot = self._slots[device]
-            current = by_device.get(device)
-            if device not in wanted or current is None or current[1] != slot.monitor:
-                slot.overlay.destroy()
-                del self._slots[device]
+            if device not in wanted or device not in by_device:
+                self._slots.pop(device).close()
         for device in wanted:
-            if device not in self._slots:
-                index, monitor = by_device[device]
-                slot = _Slot(monitor, index)
-                self._configure_smoother(slot.smoother)
-                self._slots[device] = slot
-                if not slot.overlay.excluded:
-                    log.warning("Overlay kann nicht aus der Messung ausgenommen werden – Kompensation aktiv")
+            index, monitor = by_device[device]
+            slot = self._slots.get(device)
+            if slot:
+                # Keep window and smoother: a resolution/arrangement change must not flash.
+                slot.update_geometry(monitor, index)
+                continue
+            slot = _Slot(monitor, index)
+            self._configure_smoother(slot.smoother)
+            self._slots[device] = slot
+            if not slot.overlay.excluded:
+                log.warning("Overlay kann nicht aus der Messung ausgenommen werden \u2013 Kompensation aktiv")
         with self._lock:
             self._monitors = monitors
         self._publish()
@@ -418,6 +466,7 @@ class Engine(threading.Thread):
             self._status.paused = bool(reason)
             self._status.paused_reason = reason
             self._status.monitors = rows
+            self._status.heartbeat = time.monotonic()
 
     # ---- Win32 plumbing ----------------------------------------------------------------
     def _on_window_message(self, msg: int, _wp: int, _lp: int) -> None:
@@ -453,17 +502,18 @@ class Engine(threading.Thread):
     def _unregister_hotkey(self) -> None:
         user32.UnregisterHotKey(None, HOTKEY_ID)
 
-    def _teardown(self, sampler: Sampler | None) -> None:
+    def _teardown(self) -> None:
         for slot in self._slots.values():
-            slot.overlay.destroy()  # never leave a dark screen behind
+            try:
+                slot.close()  # never leave a dark screen behind
+            except Exception:
+                log.exception("Overlay cleanup failed")
         self._slots.clear()
         for h in self._hook:
             if h:
                 user32.UnhookWinEvent(h)
         self._unregister_hotkey()
         overlay_mod.set_message_hook(None)
-        if sampler:
-            sampler.close()
         with self._lock:
             self._status.running = False
             self._status.monitors = []

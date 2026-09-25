@@ -131,6 +131,13 @@ class Overlay:
         )
         self.visible = True
 
+    def move(self, monitor: Monitor) -> None:
+        """Follow a geometry change without recreating the window (no bright flash)."""
+        self.monitor = monitor
+        m = monitor
+        flags = win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER
+        win32gui.SetWindowPos(self.hwnd, 0, m.left, m.top, m.width, m.height, flags)
+
     def keep_on_top(self) -> None:
         if self.visible:
             win32gui.SetWindowPos(
