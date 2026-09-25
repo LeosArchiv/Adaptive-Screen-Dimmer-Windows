@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     queue_handler = _setup_logging(args.verbose)
     from .engine import Engine
     from .gui import DimmerApp
+    from .tray import TrayIcon
 
     settings = settings_mod.load()
     if args.paused:
@@ -80,21 +81,22 @@ def main(argv: list[str] | None = None) -> int:
 
     engine = Engine(settings)
     engine.start()
+    tray = TrayIcon()
+    tray.start()
+    tray.wait_ready()
     root = tk.Tk()
-
-    def shutdown() -> None:
-        engine.stop()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", shutdown)
-    if args.exit_after:
-        root.after(int(args.exit_after * 1000), shutdown)
     root.report_callback_exception = lambda *exc: log.error("GUI-Fehler", exc_info=exc)
-    DimmerApp(root, engine, settings, queue_handler)  # type: ignore[arg-type]
+    ui = DimmerApp(root, engine, settings, queue_handler, tray if tray.is_alive() else None)  # type: ignore[arg-type]
+    root.protocol("WM_DELETE_WINDOW", ui.close_window)
+    if args.exit_after:
+        root.after(int(args.exit_after * 1000), ui.quit)
+    if settings.start_minimized and tray.is_alive():
+        root.withdraw()
     try:
         root.mainloop()
     finally:
         engine.stop()  # overlays are destroyed on the engine thread
+        tray.close()
     log.info("Beendet")
     return 0
 

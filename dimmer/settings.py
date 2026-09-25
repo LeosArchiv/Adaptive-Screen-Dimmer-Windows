@@ -33,6 +33,8 @@ class Settings:
     excluded_apps: list[str] = field(default_factory=list)  # lower-case exe names
     hotkey: bool = True
     start_paused: bool = False
+    close_to_tray: bool = True  # window close button hides to the notification area
+    start_minimized: bool = False
 
     def normalized(self) -> Settings:
         s = Settings(**asdict(self))
@@ -50,6 +52,8 @@ class Settings:
         s.excluded_apps = sorted({str(a).strip().lower() for a in apps if str(a).strip()})
         s.hotkey = bool(s.hotkey)
         s.start_paused = bool(s.start_paused)
+        s.close_to_tray = bool(s.close_to_tray)
+        s.start_minimized = bool(s.start_minimized)
         return s
 
 

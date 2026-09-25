@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 import queue
@@ -12,6 +13,7 @@ from . import settings as settings_mod
 from .engine import Engine, Status, wanted_devices
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS
 from .settings import Settings
+from .tray import TrayIcon
 from .winapi import Monitor
 
 log = logging.getLogger("dimmer")
@@ -67,8 +69,16 @@ class Meter(tk.Canvas):
 
 
 class DimmerApp:
-    def __init__(self, root: tk.Tk, engine: Engine, settings: Settings, log_handler: QueueLogHandler) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        engine: Engine,
+        settings: Settings,
+        log_handler: QueueLogHandler,
+        tray: TrayIcon | None = None,
+    ) -> None:
         self.root = root
+        self.tray = tray
         self.engine = engine
         self.settings = settings.normalized()
         self.log_handler = log_handler
@@ -174,11 +184,22 @@ class DimmerApp:
         opts.pack(fill=tk.X)
         self.hotkey_var = tk.BooleanVar()
         self.start_paused_var = tk.BooleanVar()
+        self.close_to_tray_var = tk.BooleanVar()
+        self.start_minimized_var = tk.BooleanVar()
         ttk.Checkbutton(
             opts, text="Tastenkürzel Strg+Alt+D (Pause/Weiter)", variable=self.hotkey_var, command=self._changed
         ).pack(anchor="w")
         ttk.Checkbutton(
             opts, text="Beim Programmstart pausiert", variable=self.start_paused_var, command=self._changed
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            opts,
+            text="Schließen-Knopf blendet nur aus (läuft im Infobereich weiter)",
+            variable=self.close_to_tray_var,
+            command=self._changed,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            opts, text="Minimiert im Infobereich starten", variable=self.start_minimized_var, command=self._changed
         ).pack(anchor="w")
 
         foot = ttk.Frame(self.root, padding=(12, 0, 12, 10))
@@ -235,6 +256,8 @@ class DimmerApp:
         self.release_var.set(s.release)
         self.hotkey_var.set(s.hotkey)
         self.start_paused_var.set(s.start_paused)
+        self.close_to_tray_var.set(s.close_to_tray)
+        self.start_minimized_var.set(s.start_minimized)
         self.exc_list.delete(0, tk.END)
         for app in s.excluded_apps:
             self.exc_list.insert(tk.END, app)
@@ -243,23 +266,23 @@ class DimmerApp:
     def _changed(self) -> None:
         if getattr(self, "_loading", False):
             return
-        s = self.settings
         start = self.start_var.get()
         full = self.full_var.get()
         if full <= start:  # keep the pair consistent while dragging either slider
             full = min(255, start + 1)
             self.full_var.set(full)
-        new = Settings(
+        new = dataclasses.replace(
+            self.settings,
             start=start,
             full=full,
             max_opacity=round(self.max_var.get() / 100 * 255),
-            interval_ms=s.interval_ms,
             attack=self.attack_var.get(),
             release=self.release_var.get(),
-            monitors=list(s.monitors),
             excluded_apps=list(self.exc_list.get(0, tk.END)),
             hotkey=self.hotkey_var.get(),
             start_paused=self.start_paused_var.get(),
+            close_to_tray=self.close_to_tray_var.get(),
+            start_minimized=self.start_minimized_var.get(),
         ).normalized()
         self._apply(new)
 
@@ -281,9 +304,17 @@ class DimmerApp:
 
     def _reset_defaults(self) -> None:
         """Reset the dimming values; monitors, exceptions and options stay as they are."""
-        k = self.settings
+        d = Settings()
         self._apply(
-            Settings(monitors=k.monitors, excluded_apps=k.excluded_apps, hotkey=k.hotkey, start_paused=k.start_paused)
+            dataclasses.replace(
+                self.settings,
+                start=d.start,
+                full=d.full,
+                max_opacity=d.max_opacity,
+                interval_ms=d.interval_ms,
+                attack=d.attack,
+                release=d.release,
+            )
         )
         self._load_into_widgets()
 
@@ -367,10 +398,61 @@ class DimmerApp:
 
     def _poll(self) -> None:
         try:
-            self._refresh(self.engine.snapshot())
+            st = self.engine.snapshot()
+            self._refresh(st)
             self._drain_log()
+            self._handle_tray(st)
         finally:
             self.root.after(POLL_MS, self._poll)
+
+    # ---- window / tray -------------------------------------------------------------------
+    def close_window(self) -> None:
+        """Window close button: hide to the tray when possible, otherwise quit."""
+        if self.tray and self.tray.is_alive() and self.settings.close_to_tray:
+            self.root.withdraw()
+        else:
+            self.quit()
+
+    def show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit(self) -> None:
+        if self._save_job:  # write pending changes before leaving
+            self.root.after_cancel(self._save_job)
+            self._save()
+        self.engine.stop()
+        if self.tray:
+            self.tray.close()
+        self.root.destroy()
+
+    def _handle_tray(self, st: Status) -> None:
+        if not self.tray:
+            return
+        while True:
+            try:
+                action = self.tray.actions.get_nowait()
+            except queue.Empty:
+                break
+            if action == "toggle":
+                self.engine.toggle_paused()
+            elif action == "show":
+                if self.root.state() == "withdrawn":
+                    self.show_window()
+                else:
+                    self.root.withdraw()
+            elif action == "quit":
+                self.quit()
+                return
+        dims = [round(m.opacity / 255 * 100) for m in st.monitors]
+        if st.paused_reason == "user":
+            tip = "Adaptive Screen Dimmer \u2013 pausiert"
+        elif st.paused_reason.startswith("app:"):
+            tip = f"Adaptive Screen Dimmer \u2013 Ausnahme {st.paused_reason[4:]}"
+        else:
+            tip = "Adaptive Screen Dimmer \u2013 aktiv, " + ", ".join(f"{d} %" for d in dims)
+        self.tray.set_state(bool(st.paused_reason), tip)
 
     def _refresh(self, st: Status) -> None:
         monitors = self.engine.monitors()
