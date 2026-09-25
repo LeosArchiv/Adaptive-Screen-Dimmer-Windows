@@ -91,7 +91,7 @@ class Smoother:
         dt = max(0.0, min(dt, 1.0))
         diff = target - self.value
         # The deadband never keeps a faint overlay alive: reaching 0 hides the window entirely.
-        if self.settled and abs(diff) < self.deadband and not (target == 0 and self.value > 0):
+        if self.settled and abs(diff) < self.deadband and not (round(target) == 0 and round(self.value) > 0):
             self._lower_since = 0.0
             return self.value
 

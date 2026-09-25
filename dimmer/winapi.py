@@ -115,9 +115,18 @@ def _stable_id(gdi_name: str, rect: tuple[int, int, int, int]) -> str:
     Cached per output name and rectangle: the periodic check then costs no driver query.
     """
     key = (gdi_name, rect)
-    if key not in _id_cache:
-        _id_cache[key] = _query_stable_id(gdi_name)
-    return _id_cache[key]
+    cached = _id_cache.get(key)
+    if cached:
+        return cached
+    stable = _query_stable_id(gdi_name)
+    if stable != gdi_name:  # never cache the fallback: the real id may be readable a moment later
+        _id_cache[key] = stable
+    return stable
+
+
+def clear_monitor_id_cache() -> None:
+    """Called on display changes: another monitor may now sit on the same output."""
+    _id_cache.clear()
 
 
 def _query_stable_id(gdi_name: str) -> str:
@@ -166,16 +175,16 @@ class Sampler:
     """
 
     def __init__(self, source_dc: int | None = None) -> None:
-        self._own_dc = source_dc is None
-        self.src_dc = user32.GetDC(None) if source_dc is None else source_dc
-        self.mem_dc = gdi32.CreateCompatibleDC(self.src_dc)
-        if not self.src_dc or not self.mem_dc:
-            self.close()
-            raise OSError("could not create a device context for screen capture")
         self._size: tuple[int, int] = (0, 0)
         self._bitmap = None
         self._old = None
         self._pixels: np.ndarray | None = None
+        self._own_dc = source_dc is None
+        self.src_dc = user32.GetDC(None) if source_dc is None else source_dc
+        self.mem_dc = gdi32.CreateCompatibleDC(self.src_dc) if self.src_dc else None
+        if not self.src_dc or not self.mem_dc:
+            self.close()
+            raise OSError("could not create a device context for screen capture")
 
     def _ensure(self, w: int, h: int) -> np.ndarray:
         if self._size != (w, h) or self._pixels is None:

@@ -27,6 +27,9 @@ def _single_instance() -> object | None:
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if not handle:  # could not create the guard at all: run without it rather than refuse
+        log.warning("Einzelinstanz-Sperre nicht verfügbar (%d)", ctypes.get_last_error())
+        return True
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
         return None

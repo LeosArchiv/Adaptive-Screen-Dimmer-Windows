@@ -158,3 +158,10 @@ def test_skip_hold_fades_out_at_once_and_smoothly() -> None:
 def test_large_dt_is_clamped() -> None:
     sm = Smoother()
     assert sm.step(240, 100.0) == 240  # clamped to 1 s, still finite and at target
+
+
+def test_deadband_releases_targets_that_round_to_zero() -> None:
+    sm = Smoother()
+    sm.reset(2.6)
+    values = run(sm, [0.5] * 40)
+    assert round(values[-1]) == 0

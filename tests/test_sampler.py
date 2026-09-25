@@ -80,3 +80,8 @@ def test_sampler_reuses_buffer_and_handles_resize() -> None:
     finally:
         sampler.close()
         src.close()
+
+
+def test_sampler_reports_invalid_source_cleanly() -> None:
+    with pytest.raises(OSError):
+        Sampler(source_dc=0)

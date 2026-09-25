@@ -21,7 +21,7 @@ from . import overlay as overlay_mod
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS, Smoother, brightness, compensate, target_opacity
 from .overlay import Overlay
 from .settings import Settings
-from .winapi import Monitor, Sampler, foreground_exe, list_monitors, user32
+from .winapi import Monitor, Sampler, clear_monitor_id_cache, foreground_exe, list_monitors, user32
 
 log = logging.getLogger("dimmer")
 
@@ -85,11 +85,13 @@ MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
 FOREGROUND_CHECK_S = 0.25
 IDLE_AFTER_S = 2.0  # screen unchanged this long -> slower measuring
-IDLE_FACTOR = 3.0
-IDLE_INTERVAL_MAX_S = 0.25
+IDLE_FACTOR = 2.0  # at most 100 ms extra latency for a flash after a still phase
+IDLE_INTERVAL_MAX_S = 0.25  # while paused
 CALM_THRESHOLD = 1.5  # brightness change (0..255) that counts as "something moved"
 EVENT_DELAY_S = 0.03
 MIN_SLEEP_S = 0.005
+FAILSAFE_AFTER = 3  # consecutive loop failures before all overlays are cleared
+CAPTURE_RENEW_AFTER = 40  # consecutive capture failures (~2 s) before the DC is renewed
 
 
 @dataclass
@@ -120,22 +122,32 @@ class _Slot:
     def __init__(self, monitor: Monitor, index: int) -> None:
         self.monitor = monitor
         self.index = index
-        self.overlay = Overlay(monitor)
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
         self.sampler = Sampler()
+        try:
+            self.overlay = Overlay(monitor)
+        except Exception:
+            self.sampler.close()
+            raise
         self.smoother = Smoother()
         self.level = 0.0
         self.target = 0.0
-        self.alpha_changed = False
+        self.capture_failures = 0
 
     def update_geometry(self, monitor: Monitor, index: int) -> None:
         self.index = index
         if monitor != self.monitor:
+            sampler = Sampler()  # swap only once the new one exists
             self.overlay.move(monitor)
-            self.monitor = monitor
             self.sampler.close()
-            self.sampler = Sampler()
+            self.sampler = sampler
+            self.monitor = monitor
+
+    def renew_sampler(self) -> None:
+        sampler = Sampler()
+        self.sampler.close()
+        self.sampler = sampler
 
     def close(self) -> None:
         self.overlay.destroy()
@@ -172,7 +184,8 @@ class Engine(threading.Thread):
         self._paused = settings.start_paused
         self._app_paused: str | None = None
         self._wake_now = False
-        self._monitors_dirty = False
+        self._monitors_dirty = True  # first loop round enumerates the monitors
+        self._force_refresh = False
         self._hook: list[int] = []
         self._hook_proc = WinEventProc(self._on_win_event)
 
@@ -229,7 +242,11 @@ class Engine(threading.Thread):
             overlay_mod.set_message_hook(self._on_window_message)
             self._register_hotkey()
             self._install_hook()
-            self._refresh_monitors()
+            try:
+                self._refresh_monitors()
+                self._monitors_dirty = False
+            except Exception:  # the loop retries; a vanishing monitor must not end the engine
+                log.exception("Bildschirme konnten beim Start nicht gelesen werden")
             with self._lock:
                 self._status.running = True
             self._ready.set()
@@ -246,6 +263,7 @@ class Engine(threading.Thread):
         last = calm_since = time.perf_counter()
         next_tick = next_monitor_check = next_topmost = next_fg = 0.0
         failures = 0
+        last_error = ""
         while not self._stop_event.is_set():
             try:
                 self._pump()
@@ -255,15 +273,17 @@ class Engine(threading.Thread):
                 now = time.perf_counter()
                 base = self._settings.interval_ms / 1000.0
                 if self._wake_now:
-                    # New window / focus / title change: leave the idle rate and measure soon,
-                    # after the window had a moment to paint, but never above the base rate.
+                    # New window / focus / title change: measure soon, after the window had a
+                    # moment to paint, never above the base rate. Whether idle mode ends is
+                    # decided by the measurement itself (a chatty title ticker must not keep
+                    # the engine at full rate).
                     self._wake_now = False
-                    calm_since = now
                     next_tick = min(next_tick, max(last + base, now + EVENT_DELAY_S))
-                if self._monitors_dirty or now >= next_monitor_check:
+                if self._monitors_dirty or self._force_refresh or now >= next_monitor_check:
                     self._monitors_dirty = False
-                    self._refresh_monitors()
                     next_monitor_check = now + MONITOR_CHECK_S
+                    self._refresh_monitors(force=self._force_refresh)
+                    self._force_refresh = False
                 if now >= next_fg:
                     self._check_foreground()
                     next_fg = now + FOREGROUND_CHECK_S
@@ -283,7 +303,8 @@ class Engine(threading.Thread):
                         slot.overlay.keep_on_top()
                     next_topmost = now + TOPMOST_REFRESH_S
                 if failures:
-                    failures = 0
+                    log.info("Messschleife läuft wieder")
+                    failures, last_error = 0, ""
                     with self._lock:
                         self._status.error = None
                 self._wait(min(next_tick, next_fg) - time.perf_counter())
@@ -291,11 +312,45 @@ class Engine(threading.Thread):
                 # A transient Win32 error (e.g. a monitor vanishing mid-enumeration) must not end
                 # the dimmer for the rest of the session: log, back off, rebuild, carry on.
                 failures += 1
-                log.exception("Fehler in der Messschleife (%d)", failures)
+                error = f"{type(e).__name__}: {e}"
+                if error != last_error:  # full traceback once per distinct error, not every 2 s
+                    log.exception("Fehler in der Messschleife")
+                    last_error = error
                 with self._lock:
-                    self._status.error = f"{type(e).__name__}: {e}"
+                    self._status.error = error
                 self._monitors_dirty = True
-                self._stop_event.wait(min(2.0, 0.2 * failures))
+                # Fail safe: while things keep failing, never leave a frozen dark overlay.
+                if failures >= FAILSAFE_AFTER or self._paused:
+                    self._clear_overlays()
+                self._publish_safe()
+                self._sleep_pumping(min(2.0, 0.2 * failures))
+
+    def _clear_overlays(self) -> None:
+        for slot in self._slots.values():
+            try:
+                slot.smoother.reset(0.0)
+                slot.overlay.set_alpha(0)
+            except Exception:
+                log.debug("could not clear overlay", exc_info=True)
+
+    def _publish_safe(self) -> None:
+        try:
+            self._publish()
+        except Exception:
+            log.debug("publish failed", exc_info=True)
+
+    def _sleep_pumping(self, seconds: float) -> None:
+        """Back off without blocking window messages (broadcasts to our overlays keep flowing)."""
+        end = time.perf_counter() + seconds
+        while not self._stop_event.is_set():
+            left = end - time.perf_counter()
+            if left <= 0:
+                return
+            user32.MsgWaitForMultipleObjects(0, None, False, max(1, math.ceil(left * 1000)), QS_ALLINPUT)
+            try:
+                self._pump()
+            except Exception:
+                log.debug("pump failed during backoff", exc_info=True)
 
     def _any_moving(self) -> bool:
         return any(not slot.smoother.settled for slot in self._slots.values())
@@ -322,31 +377,40 @@ class Engine(threading.Thread):
             elif self._app_paused is not None:
                 slot.target = 0.0
                 slot.smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
-            elif not slot.overlay.excluded and slot.alpha_changed:
-                # Compensation fallback: the capture may still show the previous alpha (DWM
-                # presents a frame later), so skip measuring while the overlay is changing.
-                slot.smoother.step(slot.target, dt)
             else:
                 try:
                     m = slot.monitor
                     level = brightness(slot.sampler.grab(m.left, m.top, m.width, m.height))
+                    slot.capture_failures = 0
                 except OSError as e:  # e.g. secure desktop (UAC, lock screen): keep last state
-                    log.debug("capture failed on %s: %s", slot.monitor.gdi_name, e)
+                    self._capture_failed(slot, e)
+                    if slot.capture_failures >= CAPTURE_RENEW_AFTER:
+                        slot.smoother.step(0.0, dt)
+                        slot.overlay.set_alpha(round(slot.smoother.value))
                     continue
                 if not slot.overlay.excluded:
+                    # The alpha set one tick (>= 16 ms, several frames) ago is what the capture shows.
                     level = compensate(level, slot.overlay.alpha)
                 if abs(level - slot.level) > CALM_THRESHOLD:
                     active = True
                 slot.level = level
                 slot.target = target_opacity(level, s.start, s.full, s.max_opacity)
                 slot.smoother.step(slot.target, dt)
-            alpha = round(slot.smoother.value)
-            slot.alpha_changed = alpha != slot.overlay.alpha
-            slot.overlay.set_alpha(alpha)
+            slot.overlay.set_alpha(round(slot.smoother.value))
             if not slot.smoother.settled:
                 active = True
         self._publish()
         return active
+
+    def _capture_failed(self, slot: _Slot, error: OSError) -> None:
+        slot.capture_failures += 1
+        log.debug("capture failed on %s: %s", slot.monitor.gdi_name, error)
+        if slot.capture_failures % CAPTURE_RENEW_AFTER == 0:
+            # Persistent failure (not just a short UAC prompt): get a fresh screen DC and, so a
+            # stale dark overlay cannot linger unnoticed, fade it out until capture works again.
+            log.warning("Bildschirm %s kann nicht gemessen werden", slot.monitor.gdi_name)
+            slot.target = 0.0
+            slot.renew_sampler()
 
     def _wait(self, seconds: float) -> None:
         if self._wake_now or self._stop_event.is_set():
@@ -390,7 +454,7 @@ class Engine(threading.Thread):
             self._unregister_hotkey()
             self._register_hotkey()
         if s.monitors != old.monitors:
-            self._refresh_monitors(force=True)
+            self._force_refresh = True  # done by the loop, which retries if it fails
         if s.excluded_apps != old.excluded_apps:
             self._check_foreground()
         self._wake_now = True
@@ -471,6 +535,7 @@ class Engine(threading.Thread):
     # ---- Win32 plumbing ----------------------------------------------------------------
     def _on_window_message(self, msg: int, _wp: int, _lp: int) -> None:
         self._monitors_dirty = True
+        clear_monitor_id_cache()
 
     def _on_win_event(self, _hook, event, hwnd, id_object, _child, _thread, _time) -> None:
         if id_object == OBJID_WINDOW and hwnd:

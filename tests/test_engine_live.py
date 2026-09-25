@@ -75,3 +75,22 @@ def test_transient_error_does_not_kill_engine(engine: Engine, monkeypatch: pytes
     assert engine.is_alive() and st.running
     assert st.error is None  # cleared after the next good round
     assert len(st.monitors) == 1
+
+
+def test_persistent_errors_keep_engine_controllable(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    import dimmer.engine as engine_mod
+
+    def broken():
+        raise OSError("display driver hiccup")
+
+    monkeypatch.setattr(engine_mod, "list_monitors", broken)
+    engine._monitors_dirty = True
+    engine._wake()
+    time.sleep(1.5)
+    st = engine.snapshot()
+    assert engine.is_alive() and st.running
+    assert st.error and "display driver hiccup" in st.error
+    assert all(m.opacity == 0 for m in st.monitors)  # fail safe: never frozen dark
+    engine.set_paused(True)
+    time.sleep(2.5)  # longest backoff is 2 s
+    assert engine.snapshot().paused_reason == "user"
