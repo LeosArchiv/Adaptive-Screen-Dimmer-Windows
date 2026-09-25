@@ -1,80 +1,71 @@
 # Adaptive Screen Dimmer (Windows)
 
-Automatically dims your screen when content gets too bright to reduce eye strain and flash blindness. Includes a simple GUI and multi‑monitor support.
+Automatically dims your screen when content gets too bright – a white web page popping up in a
+dark IDE, a flash in a game or video – to reduce eye strain and flash blindness. Lightweight,
+click-through, multi-monitor, and designed never to flicker.
 
 ## Features
-- 🛡️ Eye protection: Smooth overlay dimming based on brightness
-- 🖥️ GUI: Simple dark UI with logs and status
-- 🖲️ Multi‑monitor: Monitor 1, Monitor 2, or both
-- ⚙️ Auto‑adjust: Continuously adapts between thresholds
-- ⏱️ Fast: Checks brightness every ~50ms
-- ⏸ Pause/Resume: Quick control without closing the app
+- 🛡️ **Flash protection without flicker**: darkens quickly as a soft ramp, brightens again slowly
+  after a short hold, and ignores tiny changes – strobing content does not make it pump.
+- 🎯 **Accurate measurement**: the overlay is excluded from screen capture, so it never measures
+  itself; brightness is the exact mean over every pixel (no aliasing on text while scrolling).
+- ⚡ **Reacts to what you do**: a new window, focus change or page title change triggers an
+  immediate measurement; while the screen is still, it measures less often to save CPU.
+- 🖥️ **Any number of monitors**: pick them by checkbox with live brightness meters; monitor
+  choice survives reboots and re-plugging; hot-plug and resolution changes are handled.
+- ⏸ **Pause anywhere**: global hotkey **Ctrl+Alt+D**, tray icon menu, or the big button.
+- 🚫 **Per-app exceptions**: never dim e.g. your photo editor – add the last used program with one click.
+- 🌙 **Runs in the background**: tray icon (grey while paused), close-to-tray, start minimized.
+- ⚙️ **Live settings**, saved automatically to `%APPDATA%\AdaptiveScreenDimmer\settings.json`.
 
 ## Quick Start
-You can run either the locally built EXE or the Python script. We do not ship prebuilt binaries.
+We do not ship prebuilt binaries. Python 3.10+ **with tkinter** is required (in the official
+installer: "tcl/tk and IDLE").
 
-### Option A: Build EXE locally
-1. Ensure Python 3.10+ is installed.
-2. Build the EXE:
-   ```powershell
-   ./build_exe.bat
-   ```
-3. Start the executable: [dist/AdaptiveScreenDimmer.exe](dist/AdaptiveScreenDimmer.exe)
-   - Tip: Right‑click → “Run as administrator” can improve overlay reliability.
-
-### Option B: Python
-1. Install requirements:
-   ```powershell
-   pip install -r requirements.txt
-   ```
-2. Start via batch:
-   ```powershell
-   .\adaptive_dimmer_START.bat
-   ```
-   or directly:
-   ```powershell
-   pythonw adaptive_dimmer.py
-   ```
-
-## Building the EXE
-This project uses PyInstaller to create a one‑file GUI executable. We do not provide prebuilt EXE files; build it locally on your machine.
-
+### Option A: Build the EXE
 ```powershell
 ./build_exe.bat
 ```
+Creates `dist\AdaptiveScreenDimmer.exe` (runs without Python) and smoke-tests it.
 
-The build output is placed in [dist/AdaptiveScreenDimmer.exe](dist/AdaptiveScreenDimmer.exe). After building, you can copy this EXE anywhere; it runs without needing Python installed.
-
-### Notes on repository contents
-- Do not commit build artifacts like `dist/` or `build/` – they are ignored via [.gitignore](.gitignore).
-- If you need to share the EXE, build locally and distribute it outside the repository (e.g., attach to a release).
+### Option B: Run from source
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.\adaptive_dimmer_START.bat
+```
+No administrator rights are needed.
 
 ## Usage
-- On launch, the app auto‑starts and begins monitoring.
-- Select mode: “Nur Monitor 1”, “Nur Monitor 2”, or “Beide Bildschirme”.
-- Use “⏸ Pausieren” / “▶ Fortsetzen” to control dimming.
-- Status shows current brightness and dimming percentage; logs display detailed activity.
+| Setting | Meaning |
+|---|---|
+| Beginnt ab Helligkeit | average brightness (0–255) where dimming starts (yellow marker) |
+| Volle Stärke ab Helligkeit | brightness where the strongest dimming is reached (red marker) |
+| Stärkste Abdunkelung | how dark it gets at most (capped at 94 %, never black) |
+| Abdunkeln bei Helligkeit | Sofort / Schnell / Sanft – how fast it darkens |
+| Wieder aufhellen | Schnell / Normal / Langsam – how fast it brightens again |
 
-## Configuration
-Adjust parameters in [adaptive_dimmer.py](adaptive_dimmer.py):
-```python
-THRESHOLD_START = 25   # Dimming begins above this brightness
-THRESHOLD_MAX = 100    # Maximum dimming reached above this brightness
-MAX_OPACITY = 240      # 0–255 alpha (higher = darker)
-CHECK_INTERVAL = 0.05  # Seconds between brightness checks
+"Bildschirme kennzeichnen" shows the number of each monitor on screen.
+Command line: `--paused`, `--exit-after SEC` (quits automatically), `--verbose`.
+Log file: `%APPDATA%\AdaptiveScreenDimmer\dimmer.log`.
+
+## Limits
+- Exclusive-fullscreen games (old DirectX titles) draw above every window; no overlay can cover
+  them. Borderless/windowed fullscreen works.
+- Protected screens (UAC prompt, lock screen) cannot be measured; the last state is kept.
+- Windows 10 2004 or newer is needed to exclude the overlay from capture; older versions fall
+  back to a mathematical compensation.
+
+## Development
+```powershell
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.\tools\check.ps1          # ruff, format, mypy, unit tests
+.\tools\check.ps1 -Live    # + overlay lifecycle tests (real windows, never visibly dimming)
+.\tools\check.ps1 -Build   # + EXE build with smoke test
+.venv\Scripts\python tools\bench_live.py --monitor 0   # latency/CPU with a synthetic flash
 ```
-
-## Requirements
-- Windows 10/11 recommended (Windows 7+ may work)
-- For Python mode: Python 3.10+ recommended
-
-## Notes & Tips
-- Administrator mode may be required for reliable top‑most overlays in some setups.
-- If overlays do not appear on a monitor, switch the mode and back again.
-- Multi‑monitor coordinates are read via `mss`; unusual DPI/arrangements may need admin.
-
-## Contributing
-PRs and issues are welcome.
+Architecture: `dimmer/logic.py` (pure measurement and smoothing), `winapi.py` (monitors,
+capture), `overlay.py`, `engine.py` (one thread owns all windows), `gui.py`, `tray.py`, `app.py`.
 
 ## License
 MIT License — see [LICENSE](LICENSE).
