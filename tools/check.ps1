@@ -16,5 +16,5 @@ Step "ruff format" { & $py -m ruff format --check dimmer tests tools adaptive_di
 Step "mypy" { & $py -m mypy }
 if ($Live) { $env:ASD_LIVE_TESTS = "1" }
 Step "pytest" { & $py -m pytest -q }
-if ($Build) { Step "build" { cmd /c build_exe.bat } }
+if ($Build) { Step "build" { cmd /c "$PWD\build_exe.bat" } }
 Write-Host "All checks passed." -ForegroundColor Green

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 import win32api
 import win32con
+import win32gui
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -224,16 +225,14 @@ class Sampler:
             self.src_dc = None
 
 
-def foreground_exe() -> str | None:
-    """Lower-case exe name of the foreground window's process, None if unknown or our own."""
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return None
+def _window_pid(hwnd: int) -> int:
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    if not pid.value or pid.value == os.getpid():
-        return None
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    return int(pid.value)
+
+
+def _exe_name(pid: int) -> str | None:
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
     try:
@@ -244,3 +243,37 @@ def foreground_exe() -> str | None:
         return os.path.basename(buf.value).lower()
     finally:
         kernel32.CloseHandle(handle)
+
+
+UWP_HOST = "applicationframehost.exe"
+
+
+def foreground_exe() -> str | None:
+    """Lower-case exe name of the foreground window's process, None if unknown or our own.
+
+    Store apps are hosted by ApplicationFrameHost; for those the app's own process (owner of
+    the hosted child window) is returned, so an exception never covers all Store apps at once.
+    """
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = _window_pid(hwnd)
+    if not pid or pid == os.getpid():
+        return None
+    exe = _exe_name(pid)
+    if exe == UWP_HOST:
+        children: list[int] = []
+
+        def collect(child: int, _extra: object) -> bool:
+            children.append(child)
+            return True
+
+        try:
+            win32gui.EnumChildWindows(hwnd, collect, None)
+        except win32gui.error:
+            pass
+        for child in children:
+            child_pid = _window_pid(child)
+            if child_pid and child_pid != pid:
+                return _exe_name(child_pid) or exe
+    return exe
