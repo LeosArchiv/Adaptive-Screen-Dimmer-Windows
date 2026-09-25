@@ -33,6 +33,14 @@ FONT_TITLE = ("Segoe UI Semibold", 13)
 LOG_LINES = 300
 POLL_MS = 100
 SAVE_DELAY_MS = 600
+# Measurements per second while something moves; still screens are measured at half the rate.
+RATE_PRESETS = {"Sparsam (10/s)": 100, "Normal (20/s)": 50, "Schnell (30/s)": 33}
+
+
+def rate_name(interval_ms: int) -> str:
+    return min(RATE_PRESETS, key=lambda name: abs(RATE_PRESETS[name] - interval_ms))
+
+
 STALL_S = 3.0
 
 
@@ -156,8 +164,10 @@ class DimmerApp:
         self.release_var = tk.StringVar()
         self._combo(dim, 3, "Abdunkeln bei Helligkeit", self.attack_var, list(ATTACK_PRESETS))
         self._combo(dim, 4, "Wieder aufhellen", self.release_var, list(RELEASE_PRESETS))
+        self.rate_var = tk.StringVar()
+        self._combo(dim, 5, "Messrate", self.rate_var, list(RATE_PRESETS))
         row = ttk.Frame(dim)
-        row.grid(row=5, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        row.grid(row=6, column=0, columnspan=3, sticky="we", pady=(6, 0))
         ttk.Label(
             row, text="Balken: aktuelle Helligkeit · gelb: Beginn · rot: volle Stärke", style="Muted.TLabel"
         ).pack(side=tk.LEFT)
@@ -243,7 +253,7 @@ class DimmerApp:
 
     def _combo(self, parent: ttk.Labelframe, row: int, text: str, var: tk.StringVar, values: list[str]) -> None:
         ttk.Label(parent, text=text).grid(row=row, column=0, sticky="w", pady=2)
-        box = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=10)
+        box = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=15)
         box.grid(row=row, column=1, sticky="w", padx=8)
         box.bind("<<ComboboxSelected>>", lambda _e: self._changed())
 
@@ -256,6 +266,7 @@ class DimmerApp:
         self.max_var.set(round(s.max_opacity / 255 * 100))
         self.attack_var.set(s.attack)
         self.release_var.set(s.release)
+        self.rate_var.set(rate_name(s.interval_ms))
         self.hotkey_var.set(s.hotkey)
         self.start_paused_var.set(s.start_paused)
         self.close_to_tray_var.set(s.close_to_tray)
@@ -286,6 +297,7 @@ class DimmerApp:
             max_opacity=self._max_opacity_from_widget(),
             attack=self.attack_var.get(),
             release=self.release_var.get(),
+            interval_ms=RATE_PRESETS.get(self.rate_var.get(), self.settings.interval_ms),
             excluded_apps=list(self.exc_list.get(0, tk.END)),
             hotkey=self.hotkey_var.get(),
             start_paused=self.start_paused_var.get(),

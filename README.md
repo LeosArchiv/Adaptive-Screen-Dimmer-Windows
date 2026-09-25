@@ -44,6 +44,7 @@ No administrator rights are needed.
 | Stärkste Abdunkelung | how dark it gets at most (capped at 94 %, never black) |
 | Abdunkeln bei Helligkeit | Sofort / Schnell / Sanft – how fast it darkens |
 | Wieder aufhellen | Schnell / Normal / Langsam – how fast it brightens again |
+| Messrate | Sparsam 10/s · Normal 20/s · Schnell 30/s – measurements while the screen changes (half the rate when still); higher = faster flash protection, more CPU |
 
 "Bildschirme kennzeichnen" shows the number of each monitor on screen.
 Command line: `--paused`, `--exit-after SEC` (quits automatically), `--verbose`.
