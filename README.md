@@ -14,7 +14,14 @@ click-through, multi-monitor, and designed never to flicker.
 - 🖥️ **Any number of monitors**: pick them by checkbox with live brightness meters; monitor
   choice survives reboots and re-plugging; hot-plug and resolution changes are handled.
 - ⏸ **Pause anywhere**: global hotkey **Ctrl+Alt+D**, tray icon menu, or the big button.
-- 🚫 **Per-app exceptions**: never dim e.g. your photo editor – add the last used program with one click.
+- 🎛️ **Profiles per monitor**: Tag, Nacht, Arbeit, Zocken, Filme (editable, add your own). Each
+  monitor has a base profile – fixed, or automatic day/night by a schedule with a smooth transition.
+- 🎮 **App profiles**: when e.g. `DDNet.exe` is in front on a monitor, its profile applies on *that*
+  monitor only; the other monitors keep theirs. Profile "Aus" never dims (for a photo editor etc.).
+- 🧩 **Mixes**: a profile can take the dimming or the blue-light filter over from the base profile,
+  so "Zocken" at night automatically becomes "Zocken + Nacht".
+- 🌅 **Blue-light filter** on every monitor (also where Windows Night Light does not work): a warm
+  overlay with colour temperature and strength, fading in and out gently.
 - 🌙 **Runs in the background**: tray icon (grey while paused), close-to-tray, start minimized.
 - ⚙️ **Live settings**, saved automatically to `%APPDATA%\AdaptiveScreenDimmer\settings.json`.
 
@@ -37,6 +44,12 @@ py -3 -m venv .venv
 No administrator rights are needed.
 
 ## Usage
+Tabs: **Übersicht** (monitors, base profile, what is active), **Profile** (editor),
+**Programme** (app → profile rules; the list suggests apps recently in front),
+**Zeitplan** (day/night times and transition), **Optionen**.
+
+Profile settings (each group: *eigene Werte* / *vom Grundprofil übernehmen* / *aus*):
+
 | Setting | Meaning |
 |---|---|
 | Beginnt ab Helligkeit | average brightness (0–255) where dimming starts (yellow marker) |
@@ -44,7 +57,8 @@ No administrator rights are needed.
 | Stärkste Abdunkelung | how dark it gets at most (capped at 94 %, never black) |
 | Abdunkeln bei Helligkeit | Sofort / Schnell / Sanft – how fast it darkens |
 | Wieder aufhellen | Schnell / Normal / Langsam – how fast it brightens again |
-| Messrate | Sparsam 10/s · Normal 20/s · Schnell 30/s – measurements while the screen changes (half the rate when still); higher = faster flash protection, more CPU |
+| Farbtemperatur / Stärke | blue-light filter: lower kelvin = warmer; strength up to 60 % |
+| Messrate (Optionen) | Sparsam 10/s · Normal 20/s · Schnell 30/s – measurements while the screen changes (half the rate when still); higher = faster flash protection, more CPU |
 
 "Bildschirme kennzeichnen" shows the number of each monitor on screen.
 Command line: `--paused`, `--exit-after SEC` (quits automatically), `--verbose`.
@@ -54,6 +68,8 @@ Log file: `%APPDATA%\AdaptiveScreenDimmer\dimmer.log`.
 - Exclusive-fullscreen games (old DirectX titles) draw above every window; no overlay can cover
   them. Borderless/windowed fullscreen works.
 - Protected screens (UAC prompt, lock screen) cannot be measured; the last state is kept.
+- The blue-light filter is an overlay, not a change of the display's colour pipeline: warm, but
+  blacks get slightly lifted at high strength. It works on every monitor and never stays behind.
 - Windows 10 2004 or newer is needed to exclude the overlay from capture; older versions fall
   back to a mathematical compensation.
 
@@ -65,8 +81,8 @@ Log file: `%APPDATA%\AdaptiveScreenDimmer\dimmer.log`.
 .\tools\check.ps1 -Build   # + EXE build with smoke test
 .venv\Scripts\python tools\bench_live.py --monitor 0   # latency/CPU with a synthetic flash
 ```
-Architecture: `dimmer/logic.py` (pure measurement and smoothing), `winapi.py` (monitors,
-capture), `overlay.py`, `engine.py` (one thread owns all windows), `gui.py`, `tray.py`, `app.py`.
+Architecture: `dimmer/logic.py` (pure measurement and smoothing), `profiles.py` (pure profile,
+rule and schedule resolution), `winapi.py` (monitors, capture, apps per monitor), `overlay.py`, `engine.py` (one thread owns all windows), `gui.py`, `tray.py`, `app.py`.
 
 ## License
 MIT License — see [LICENSE](LICENSE).
