@@ -22,6 +22,7 @@ import numpy as np
 
 from . import overlay as overlay_mod
 from . import wgc
+from .gamma import GammaTint, channel_factors
 from .gpu import GpuBrightness
 from .localdim import LocalDimmer
 from .logic import (
@@ -248,6 +249,7 @@ class _Slot:
         self.pending_hits = 0
         self.tint_strength = 0.0  # current, fades toward effective.tint_strength
         self.tint_kelvin = 3400.0
+        self.gamma = GammaTint(monitor.gdi_name)  # preferred: warm white without a coloured veil
         self.start_gpu_capture()
 
     # ---- measuring -------------------------------------------------------------------------
@@ -383,6 +385,8 @@ class _Slot:
             return
         if monitor != self.monitor:
             sampler = Sampler()  # swap only once the new one exists
+            self.gamma.reset()
+            self.gamma = GammaTint(monitor.gdi_name)
             self.warm.move(monitor)
             self.dim.move(monitor)
             self.sampler.close()
@@ -412,7 +416,15 @@ class _Slot:
         self.tint_strength = _approach(self.tint_strength, goal, TINT_RATE * dt)
         if self.effective.tint_on:
             self.tint_kelvin = _approach(self.tint_kelvin, self.effective.tint_kelvin, KELVIN_RATE * dt)
-        self.warm.set_color(kelvin_to_rgb(self.tint_kelvin))
+        rgb = kelvin_to_rgb(self.tint_kelvin)
+        if not self.gamma.failed:
+            try:
+                if self.gamma.apply(channel_factors(rgb, self.tint_strength)):
+                    self.warm.set_alpha(0)
+                    return
+            except OSError:
+                self.gamma.failed = True
+        self.warm.set_color(rgb)  # fallback: coloured overlay
         self.warm.set_alpha(round(self.tint_strength / 100 * 255))
 
     def keep_on_top(self) -> None:
@@ -422,6 +434,7 @@ class _Slot:
         if self.local is not None:
             self.local.keep_on_top(even_hidden=True)
         self.warm.keep_on_top()
+        self.gamma.reassert()
 
     # ---- local dimming ------------------------------------------------------------------------
     @property
@@ -511,6 +524,10 @@ class _Slot:
         self.tint_strength = 0.0
         self.mask = self.mask_target = None
         self._mask_moving = False
+        try:
+            self.gamma.reset()
+        except Exception:
+            log.debug("could not reset gamma", exc_info=True)
         for layer in (self.overlay, self.tint, self.local):
             if layer is None:
                 continue
@@ -520,6 +537,10 @@ class _Slot:
                 log.debug("could not hide overlay", exc_info=True)
 
     def close(self) -> None:
+        try:
+            self.gamma.reset()
+        except Exception:
+            log.debug("could not reset gamma", exc_info=True)
         self.stop_local()
         self.stop_gpu_capture()
         if self.overlay:
