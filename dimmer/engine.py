@@ -42,7 +42,7 @@ from .logic import (
 from .overlay import Overlay
 from .profiles import GLARE_WEIGHTS, Effective, kelvin_to_rgb, resolve_monitor
 from .settings import Settings
-from .winapi import Monitor, Sampler, apps_per_monitor, clear_monitor_id_cache, list_monitors, user32
+from .winapi import Monitor, Sampler, clear_monitor_id_cache, list_monitors, user32, windows_per_monitor
 
 log = logging.getLogger("dimmer")
 
@@ -240,9 +240,11 @@ class _Slot:
         self._fingerprint: np.ndarray | None = None
         self._fingerprint_spot = False
         self.effective = Effective()
-        self.app: str | None = None
+        self.app: tuple[str | None, str] | str | None = None  # confirmed window in front
+        self.front_exe: str | None = None
+        self.front_title = ""
         self.app_known = False
-        self.pending_app: str | None = None
+        self.pending_app: tuple[str | None, str] | str | None = None
         self.pending_hits = 0
         self.tint_strength = 0.0  # current, fades toward effective.tint_strength
         self.tint_kelvin = 3400.0
@@ -994,17 +996,19 @@ class Engine(threading.Thread):
     def _resolve_profiles(self) -> None:
         """Decide per monitor which profile applies: base (fixed or day/night) + app in front."""
         s = self._settings
-        profiles, rules = s.profile_map(), s.rule_map()
-        apps = apps_per_monitor([slot.monitor for slot in self._slots.values()]) if self._slots else {}
+        profiles, rules = s.profile_map(), s.rules
+        windows = windows_per_monitor([slot.monitor for slot in self._slots.values()]) if self._slots else {}
         lt = time.localtime()
         minute = lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60
         for device, slot in self._slots.items():
-            app = self._confirmed_app(slot, apps.get(device))
+            front = self._confirmed_app(slot, windows.get(device))
+            app, title = front if isinstance(front, tuple) else (front, "")
+            slot.front_exe, slot.front_title = app, title
             if app and (not self._recent_apps or self._recent_apps[0] != app):
                 if app in self._recent_apps:
                     self._recent_apps.remove(app)
                 self._recent_apps.appendleft(app)
-            effective = resolve_monitor(profiles, rules, s.schedule, s.base_choice(device), app, minute)
+            effective = resolve_monitor(profiles, rules, s.schedule, s.base_choice(device), app, minute, title)
             if effective.label != slot.effective.label:
                 log.info("%s: Profil %s (%s)", slot.monitor.gdi_name, effective.label, effective.reason)
             if effective != slot.effective:
@@ -1017,7 +1021,7 @@ class Engine(threading.Thread):
                     self._wake_now = True
 
     @staticmethod
-    def _confirmed_app(slot: _Slot, seen: str | None) -> str | None:
+    def _confirmed_app(slot: _Slot, seen: tuple[str | None, str] | str | None) -> tuple[str | None, str] | str | None:
         """Accept a new app in front only when seen twice in a row (~0.25 s): Start menu,
         Alt+Tab and similar short-lived windows must not make the profile flip back and forth."""
         if not slot.app_known:
@@ -1084,7 +1088,7 @@ class Engine(threading.Thread):
                 excluded_from_capture=slot.dim.excluded,
                 profile=slot.effective.label,
                 reason=slot.effective.reason,
-                app=slot.app,
+                app=slot.front_exe,
                 tint=slot.tint_strength,
                 start=slot.effective.start if slot.effective.dim_on else None,
                 full=slot.effective.full if slot.effective.dim_on else None,

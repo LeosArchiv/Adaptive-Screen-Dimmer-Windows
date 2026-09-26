@@ -403,26 +403,32 @@ class DimmerApp:
         ttk.Label(
             body,
             text="Liegt ein Programm auf einem Bildschirm vorne, gilt dort sein Profil –\n"
-            "nur auf diesem Bildschirm. „Aus“ = dort nie abdunkeln.",
+            "nur auf diesem Bildschirm. „Aus“ = dort nie abdunkeln.\n"
+            "Mit Fenstertitel (z. B. „YouTube“) gilt die Regel in jedem Browser, solange so ein Tab vorne ist.",
             style="Muted.TLabel",
             justify=tk.LEFT,
         ).pack(anchor="w", pady=(0, 6))
-        self.rule_tree = ttk.Treeview(body, columns=("exe", "profile"), show="headings", height=8)
+        self.rule_tree = ttk.Treeview(body, columns=("exe", "title", "profile"), show="headings", height=8)
         self.rule_tree.heading("exe", text="Programm")
+        self.rule_tree.heading("title", text="Fenstertitel enthält")
         self.rule_tree.heading("profile", text="Profil")
-        self.rule_tree.column("exe", width=220)
+        self.rule_tree.column("exe", width=180)
+        self.rule_tree.column("title", width=160)
         self.rule_tree.column("profile", width=160)
         self.rule_tree.pack(fill=tk.BOTH, expand=True)
         self.rule_tree.bind("<<TreeviewSelect>>", lambda _e: self._rule_selected())
         form = ttk.Frame(body)
         form.pack(fill=tk.X, pady=(8, 0))
-        self.r_exe, self.r_profile = tk.StringVar(), tk.StringVar()
+        self.r_exe, self.r_profile, self.r_title = tk.StringVar(), tk.StringVar(), tk.StringVar()
         ttk.Label(form, text="Programm").grid(row=0, column=0, sticky="w")
         self.r_exe_box = ttk.Combobox(form, textvariable=self.r_exe, width=24)
         self.r_exe_box.grid(row=0, column=1, sticky="w", padx=6)
         ttk.Label(form, text="Profil").grid(row=0, column=2, sticky="w")
         self.r_profile_box = ttk.Combobox(form, textvariable=self.r_profile, state="readonly", width=14)
         self.r_profile_box.grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Label(form, text="Fenstertitel enthält").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(form, textvariable=self.r_title, width=26).grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
+        ttk.Label(form, text="(leer = egal)", style="Muted.TLabel").grid(row=1, column=2, columnspan=2, sticky="w")
         buttons = ttk.Frame(body)
         buttons.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(buttons, text="Hinzufügen / ändern", command=self._save_rule).pack(side=tk.LEFT)
@@ -518,8 +524,8 @@ class DimmerApp:
             self.profile_list.selection_set(idx)
             self._load_profile()
             self.rule_tree.delete(*self.rule_tree.get_children())
-            for r in s.rules:
-                self.rule_tree.insert("", tk.END, iid=r.exe, values=(r.exe, r.profile))
+            for i, r in enumerate(s.rules):
+                self.rule_tree.insert("", tk.END, iid=str(i), values=(r.exe or "(jedes)", r.title, r.profile))
             self.r_profile_box.config(values=names)
             if self.r_profile.get() not in names:
                 self.r_profile.set(names[0])
@@ -687,7 +693,7 @@ class DimmerApp:
             dataclasses.replace(
                 s,
                 profiles=[dataclasses.replace(p, name=ren(p.name)) for p in s.profiles],
-                rules=[Rule(r.exe, ren(r.profile)) for r in s.rules],
+                rules=[Rule(r.exe, ren(r.profile), r.title) for r in s.rules],
                 schedule=dataclasses.replace(
                     s.schedule, day_profile=ren(s.schedule.day_profile), night_profile=ren(s.schedule.night_profile)
                 ),
@@ -704,7 +710,9 @@ class DimmerApp:
         if len(self._profile_names(with_off=False)) <= 1:
             messagebox.showinfo("Profile", "Das letzte Profil kann nicht gelöscht werden.", parent=self.root)
             return
-        used = [r.exe for r in s.rules if r.profile == name]
+        used = [
+            " + ".join(x for x in (r.exe, f"„{r.title}“" if r.title else "") if x) for r in s.rules if r.profile == name
+        ]
         text = f"Profil „{name}“ löschen?"
         if used:
             text += "\nDiese Regeln werden mit entfernt: " + ", ".join(used)
@@ -723,27 +731,32 @@ class DimmerApp:
         )
 
     # ---- rules -------------------------------------------------------------------------------
+    def _selected_rules(self) -> list[Rule]:
+        rules = self.settings.rules
+        return [rules[int(i)] for i in self.rule_tree.selection() if int(i) < len(rules)]
+
     def _rule_selected(self) -> None:
-        sel = self.rule_tree.selection()
+        sel = self._selected_rules()
         if sel:
-            rule = self.settings.rule_map()
-            self.r_exe.set(sel[0])
-            self.r_profile.set(rule.get(sel[0], ""))
+            self.r_exe.set(sel[0].exe)
+            self.r_title.set(sel[0].title)
+            self.r_profile.set(sel[0].profile)
 
     def _save_rule(self) -> None:
         exe = self.r_exe.get().strip().lower()
+        title = self.r_title.get().strip()
         prof = self.r_profile.get()
-        if not exe or prof not in self.settings.profile_map():
+        if not (exe or title) or prof not in self.settings.profile_map():
             return
-        if not exe.endswith(".exe"):
+        if exe and not exe.endswith(".exe"):
             exe += ".exe"
-        rules = [r for r in self.settings.rules if r.exe != exe] + [Rule(exe, prof)]
-        self._apply(dataclasses.replace(self.settings, rules=rules), reload=True)
+        rules = [r for r in self.settings.rules if (r.exe, r.title.lower()) != (exe, title.lower())]
+        self._apply(dataclasses.replace(self.settings, rules=rules + [Rule(exe, prof, title)]), reload=True)
 
     def _remove_rule(self) -> None:
-        sel = set(self.rule_tree.selection())
+        sel = self._selected_rules()
         if sel:
-            rules = [r for r in self.settings.rules if r.exe not in sel]
+            rules = [r for r in self.settings.rules if r not in sel]
             self._apply(dataclasses.replace(self.settings, rules=rules), reload=True)
 
     # ---- schedule / options ----------------------------------------------------------------

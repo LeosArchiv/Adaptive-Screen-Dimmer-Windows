@@ -156,3 +156,24 @@ def dataclasses_replace(obj, **kw):  # small helper to keep imports local to thi
     import dataclasses
 
     return dataclasses.replace(obj, **kw)
+
+
+def test_title_rule_applies_to_any_browser_tab() -> None:
+    from dimmer.profiles import Rule
+
+    rules = [Rule("", "Filme", "YouTube"), Rule("brave.exe", "Arbeit")]
+    e = resolve_monitor(profiles(), rules, Schedule(), AUTO, "brave.exe", 12 * H, "Lustiges Video - YouTube - Brave")
+    assert e.label.startswith("Filme")  # title rule is more specific than the program rule
+    e = resolve_monitor(profiles(), rules, Schedule(), AUTO, "brave.exe", 12 * H, "Nachrichten - Brave")
+    assert e.label.startswith("Arbeit")
+    e = resolve_monitor(profiles(), rules, Schedule(), AUTO, "notepad.exe", 12 * H, "youtube.txt - Editor")
+    assert e.label.startswith("Filme")  # case-insensitive, any program
+
+
+def test_program_and_title_rule_beats_title_rule() -> None:
+    from dimmer.profiles import Rule, find_rule
+
+    rules = [Rule("", "Filme", "S.to"), Rule("brave.exe", "Zocken", "S.to")]
+    assert find_rule(rules, "brave.exe", "Serie Staffel 1 - S.to - Brave").profile == "Zocken"
+    assert find_rule(rules, "chrome.exe", "Serie - S.to").profile == "Filme"
+    assert find_rule(rules, "brave.exe", "Suche - Brave") is None

@@ -51,7 +51,7 @@ No administrator rights are needed.
 
 ## Usage
 Tabs: **Übersicht** (monitors, base profile, what is active), **Profile** (editor),
-**Programme** (app → profile rules; the list suggests apps recently in front),
+**Programme** (app → profile rules; the list suggests apps recently in front; a rule can also match the window title, e.g. YouTube in any browser),
 **Zeitplan** (day/night times and transition), **Optionen**.
 
 Profile settings (each group: *eigene Werte* / *vom Grundprofil übernehmen* / *aus*):

@@ -359,7 +359,19 @@ def top_windows() -> list[int]:
 
 def apps_per_monitor(monitors: list[Monitor]) -> dict[str, str | None]:
     """For each monitor the exe of the topmost real app window on it (None: only desktop)."""
-    found: dict[str, str | None] = {}
+    return {d: exe for d, (exe, _title) in windows_per_monitor(monitors).items()}
+
+
+def _window_title(hwnd: int) -> str:
+    try:
+        return str(win32gui.GetWindowText(hwnd))
+    except win32gui.error:
+        return ""
+
+
+def windows_per_monitor(monitors: list[Monitor]) -> dict[str, tuple[str | None, str]]:
+    """For each monitor (exe, title) of the topmost real app window on it."""
+    found: dict[str, tuple[str | None, str]] = {}
     rect = wintypes.RECT()
     shell = user32.GetShellWindow()
     alive: set[tuple[int, int]] = set()
@@ -395,8 +407,9 @@ def apps_per_monitor(monitors: list[Monitor]) -> dict[str, str | None]:
             continue  # our own window: look at what is underneath
         alive.add((hwnd, pid))
         exe = window_exe(hwnd)
+        title = _window_title(hwnd)
         for m in covered:
-            found[m.device] = exe
+            found[m.device] = (exe, title)
     for key in [k for k in _window_cache if k not in alive]:
         if len(_window_cache) > 64:
             _window_cache.pop(key, None)

@@ -76,8 +76,28 @@ class Profile:
 
 @dataclass
 class Rule:
-    exe: str  # lower-case exe name, e.g. "ddnet.exe"
+    exe: str  # lower-case exe name, e.g. "ddnet.exe"; "" = any program
     profile: str
+    title: str = ""  # window title must contain this (case-insensitive); "" = any title
+
+    def matches(self, exe: str | None, title: str) -> bool:
+        if self.exe and self.exe != exe:
+            return False
+        return not self.title or self.title.lower() in title.lower()
+
+    @property
+    def specificity(self) -> int:
+        """Program + title beats title only beats program only."""
+        return (2 if self.title else 0) + (1 if self.exe else 0)
+
+
+def find_rule(rules: list[Rule], exe: str | None, title: str) -> Rule | None:
+    """The most specific rule for the window in front (e.g. 'YouTube' in a browser title)."""
+    best: Rule | None = None
+    for rule in rules:
+        if rule.matches(exe, title) and (best is None or rule.specificity > best.specificity):
+            best = rule
+    return best
 
 
 @dataclass
@@ -106,7 +126,12 @@ def default_profiles() -> list[Profile]:
 
 
 def default_rules() -> list[Rule]:
-    return [Rule("ddnet.exe", "Zocken"), Rule("vlc.exe", "Filme")]
+    return [
+        Rule("ddnet.exe", "Zocken"),
+        Rule("vlc.exe", "Filme"),
+        Rule("", "Filme", "YouTube"),  # in any browser, only while such a tab is in front
+        Rule("", "Filme", "S.to"),
+    ]
 
 
 def clamp(value: object, lo: int, hi: int) -> int:
@@ -269,13 +294,14 @@ def schedule_phase(schedule: Schedule, minute_of_day: float) -> tuple[str, str, 
 
 def resolve_monitor(
     profiles: dict[str, Profile],
-    rules: dict[str, str],
+    rules: list[Rule] | dict[str, str],
     schedule: Schedule,
     base_choice: str,
     exe: str | None,
     minute_of_day: float,
+    title: str = "",
 ) -> Effective:
-    """Values for one monitor given its base profile choice and the app in front on it."""
+    """Values for one monitor given its base profile choice and the window in front on it."""
     if base_choice != AUTO and base_choice in profiles:
         base = effective_of(profiles[base_choice], "fest eingestellt")
     elif schedule.enabled:
@@ -286,9 +312,11 @@ def resolve_monitor(
     else:
         first = profiles.get(schedule.day_profile) or next(iter(profiles.values()))
         base = effective_of(first, "Standard")
-    app_profile = rules.get(exe) if exe else None
-    if exe and app_profile and app_profile in profiles:
-        return overlay_app(base, profiles[app_profile], exe)
+    rule_list = [Rule(e, p) for e, p in rules.items()] if isinstance(rules, dict) else rules
+    rule = find_rule(rule_list, exe, title) if (exe or title) else None
+    if rule and rule.profile in profiles:
+        what = f"„{rule.title}“" if rule.title else (exe or "")
+        return overlay_app(base, profiles[rule.profile], what)
     return base
 
 

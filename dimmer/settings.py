@@ -53,7 +53,8 @@ class Settings:
         return {p.name: p for p in self.profiles}
 
     def rule_map(self) -> dict[str, str]:
-        return {r.exe: r.profile for r in self.rules}
+        """Program-only rules (exe -> profile)."""
+        return {r.exe: r.profile for r in self.rules if r.exe and not r.title}
 
     def base_choice(self, device: str) -> str:
         return self.monitor_profiles.get(device, AUTO)
@@ -80,13 +81,15 @@ class Settings:
         names = {p.name for p in profiles}
         first = next(p.name for p in profiles if not p.builtin)
 
-        rules: dict[str, str] = {}
+        rules: dict[tuple[str, str], str] = {}
         for r in s.rules if isinstance(s.rules, list) else []:
-            if isinstance(r, Rule) and isinstance(r.exe, str) and isinstance(r.profile, str):
-                exe = r.exe.strip().lower()
-                if exe and r.profile in names:
-                    rules[exe] = r.profile
-        s.rules = [Rule(exe, prof) for exe, prof in sorted(rules.items())]
+            if not isinstance(r, Rule) or not isinstance(r.exe, str) or not isinstance(r.profile, str):
+                continue
+            title = r.title.strip()[:80] if isinstance(r.title, str) else ""
+            exe = r.exe.strip().lower()
+            if (exe or title) and r.profile in names:
+                rules[(exe, title)] = r.profile
+        s.rules = [Rule(exe, prof, title) for (exe, title), prof in sorted(rules.items())]
 
         sch = s.schedule if isinstance(s.schedule, Schedule) else Schedule()
         sch = dataclasses.replace(

@@ -14,7 +14,12 @@ def names(s: Settings) -> list[str]:
 def test_missing_file_gives_defaults(tmp_path: Path) -> None:
     s = load(tmp_path / "nope.json")
     assert names(s) == ["Tag", "Nacht", "Arbeit", "Zocken", "Filme", OFF_PROFILE]
-    assert {r.exe: r.profile for r in s.rules} == {"ddnet.exe": "Zocken", "vlc.exe": "Filme"}
+    assert {(r.exe, r.title): r.profile for r in s.rules} == {
+        ("ddnet.exe", ""): "Zocken",
+        ("vlc.exe", ""): "Filme",
+        ("", "YouTube"): "Filme",
+        ("", "S.to"): "Filme",
+    }
 
 
 def test_corrupt_file_gives_defaults(tmp_path: Path) -> None:
@@ -141,3 +146,14 @@ def test_unreadable_file_is_kept_as_bad(tmp_path: Path) -> None:
     p.write_text("{broken", encoding="utf-8")
     load(p)
     assert (tmp_path / "settings.bad").read_text(encoding="utf-8") == "{broken"
+
+
+def test_title_rules_roundtrip_and_validation(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    s = Settings(rules=[Rule("", "Filme", " YouTube "), Rule("", "Filme", ""), Rule("Brave.exe", "Tag", "S.to")])
+    save(s, p)
+    loaded = load(p)
+    assert [(r.exe, r.profile, r.title) for r in loaded.rules] == [
+        ("", "Filme", "YouTube"),
+        ("brave.exe", "Tag", "S.to"),
+    ]  # the rule without program and title was dropped

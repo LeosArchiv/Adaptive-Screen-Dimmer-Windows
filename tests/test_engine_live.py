@@ -116,7 +116,9 @@ def test_app_rule_switches_profile_only_on_that_monitor(engine: Engine, monkeypa
     monitors = engine.monitors()
     ids = [m.device for m in monitors]
     fake_app = {ids[0]: "game.exe"}
-    monkeypatch.setattr(engine_mod, "apps_per_monitor", lambda mons: {m.device: fake_app.get(m.device) for m in mons})
+    monkeypatch.setattr(
+        engine_mod, "windows_per_monitor", lambda mons: {m.device: (fake_app.get(m.device), "") for m in mons}
+    )
     engine.update_settings(
         Settings(
             profiles=[Profile("Test", max_opacity=0), Profile("Spiel", max_opacity=0, attack="Sofort")],
