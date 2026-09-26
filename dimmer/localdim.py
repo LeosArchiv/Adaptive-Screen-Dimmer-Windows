@@ -48,6 +48,10 @@ D3D11_USAGE_DEFAULT = 0
 D3D11_FILTER_MIN_MAG_MIP_LINEAR = 0x15
 D3D11_TEXTURE_ADDRESS_CLAMP = 3
 D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST = 4
+D3D11_COMPARISON_NEVER = 1
+DXGI_PRESENT_DO_NOT_WAIT = 0x8
+DXGI_ERROR_WAS_STILL_DRAWING = -2005270518
+DCOMP_CHECK_DEVICE_STATE = 26
 
 # vtable indices
 DEV_CREATE_TEXTURE2D, DEV_CREATE_SRV, DEV_CREATE_RTV = 5, 7, 9
@@ -55,28 +59,43 @@ DEV_CREATE_VS, DEV_CREATE_PS, DEV_CREATE_SAMPLER = 12, 15, 23
 CTX_PS_SET_SRV, CTX_PS_SET_SHADER, CTX_PS_SET_SAMPLERS, CTX_VS_SET_SHADER = 8, 9, 10, 11
 CTX_DRAW, CTX_IA_SET_LAYOUT, CTX_IA_SET_TOPOLOGY = 13, 17, 24
 CTX_OM_SET_RT, CTX_RS_SET_VIEWPORTS, CTX_UPDATE_SUBRESOURCE = 33, 44, 48
+CTX_CLEAR_RTV = 50
 FACTORY2_CREATE_SWAPCHAIN_FOR_COMPOSITION = 24
 SWAPCHAIN_PRESENT, SWAPCHAIN_GET_BUFFER = 8, 9
 DCOMP_COMMIT, DCOMP_CREATE_TARGET_FOR_HWND, DCOMP_CREATE_VISUAL = 3, 6, 7
 TARGET_SET_ROOT = 3
 VISUAL_SET_CONTENT = 15  # after SetOffsetX x2, SetOffsetY x2, SetTransform x2, parent, effect, interp, border, clip x2
 
-VS = b"""
-float4 main(uint id : SV_VertexID, out float2 uv : TEXCOORD0) : SV_Position
+SHADER_COMMON = """
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+"""
+VS = (
+    SHADER_COMMON
+    + """
+VSOut main(uint id : SV_VertexID)
 {
-    uv = float2((id << 1) & 2, id & 2);
-    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    VSOut o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
 }
 """
-PS = b"""
+)
+# The mask texture covers whole 16 px tiles (e.g. 68 x 16 = 1088 px for a 1080 px screen), so
+# screen UVs are scaled by screen / (tiles * 16) to keep the mask exactly over the spot.
+PS_TEMPLATE = (
+    SHADER_COMMON
+    + """
 Texture2D<float> mask : register(t0);
 SamplerState lin : register(s0);
-float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+float4 main(VSOut i) : SV_Target
 {
-    float a = mask.Sample(lin, uv);
+    float a = mask.Sample(lin, i.uv * float2(%(sx).8f, %(sy).8f));
     return float4(0, 0, 0, a);  // premultiplied black
 }
 """
+)
 
 
 class DXGI_SWAP_CHAIN_DESC1(ctypes.Structure):
@@ -218,6 +237,10 @@ class LocalDimmer:
         win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 255, win32con.LWA_ALPHA)
         self.excluded = exclude_from_capture(self.hwnd) if exclude else False
         try:
+            if exclude and not self.excluded:
+                # The capture would see the darkened spot, the mask would drop, the spot return:
+                # a pumping loop. Better no local layer at all.
+                raise GpuError("local layer cannot be excluded from screen capture")
             self._build()
         except Exception:
             self.close()
@@ -297,7 +320,9 @@ class LocalDimmer:
         check(vcall(self.target, TARGET_SET_ROOT, HRESULT, [c_void_p], self.visual), "SetRoot")
         check(vcall(self.dcomp, DCOMP_COMMIT, HRESULT, []), "Commit")
         # shaders, sampler, mask texture
-        vs_code, ps_code = _compile(VS, b"vs_5_0"), _compile(PS, b"ps_5_0")
+        scale = {"sx": m.width / (self.grid_w * 16), "sy": m.height / (self.grid_h * 16)}
+        vs_code = _compile(VS.encode(), b"vs_5_0")
+        ps_code = _compile((PS_TEMPLATE % scale).encode(), b"ps_5_0")
         self.vs = self._keep(c_void_p())
         check(
             vcall(
@@ -333,7 +358,7 @@ class LocalDimmer:
             D3D11_TEXTURE_ADDRESS_CLAMP,
             0.0,
             1,
-            0,
+            D3D11_COMPARISON_NEVER,
             (c_float * 4)(0, 0, 0, 0),
             0.0,
             3.4e38,
@@ -388,27 +413,6 @@ class LocalDimmer:
             ),
             "CreateShaderResourceView(mask)",
         )
-        _ = ctx
-
-    def show_mask(self, alpha: np.ndarray) -> None:
-        """Draw the mask (grid-sized array of 0..1) and show the layer; all zero hides it."""
-        if not alpha.any():
-            self.hide()
-            return
-        data = np.ascontiguousarray(np.clip(alpha * 255.0 + 0.5, 0, 255).astype(np.uint8))
-        dev, ctx = self.gpu.device, self.gpu.context
-        vcall(
-            ctx,
-            CTX_UPDATE_SUBRESOURCE,
-            None,
-            [c_void_p, c_uint, c_void_p, c_void_p, c_uint, c_uint],
-            self.mask_tex,
-            0,
-            None,
-            data.ctypes.data,
-            data.shape[1],
-            0,
-        )
         back = c_void_p()
         check(
             vcall(
@@ -422,33 +426,50 @@ class LocalDimmer:
             ),
             "GetBuffer",
         )
-        rtv = c_void_p()
         try:
+            # Flip model in D3D11: buffer 0 always refers to the current back buffer, so one view
+            # serves every frame.
+            self.rtv = self._keep(c_void_p())
             check(
-                vcall(dev, DEV_CREATE_RTV, HRESULT, [c_void_p, c_void_p, POINTER(c_void_p)], back, None, byref(rtv)),
+                vcall(
+                    dev, DEV_CREATE_RTV, HRESULT, [c_void_p, c_void_p, POINTER(c_void_p)], back, None, byref(self.rtv)
+                ),
                 "CreateRenderTargetView",
             )
-            m = self.monitor
-            vp = D3D11_VIEWPORT(0, 0, float(m.width), float(m.height), 0.0, 1.0)
-            rtvs = (c_void_p * 1)(rtv.value)
-            vcall(ctx, CTX_OM_SET_RT, None, [c_uint, c_void_p, c_void_p], 1, rtvs, None)
-            vcall(ctx, CTX_RS_SET_VIEWPORTS, None, [c_uint, POINTER(D3D11_VIEWPORT)], 1, byref(vp))
-            vcall(ctx, CTX_IA_SET_LAYOUT, None, [c_void_p], None)
-            vcall(ctx, CTX_IA_SET_TOPOLOGY, None, [c_uint], D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-            vcall(ctx, CTX_VS_SET_SHADER, None, [c_void_p, c_void_p, c_uint], self.vs, None, 0)
-            vcall(ctx, CTX_PS_SET_SHADER, None, [c_void_p, c_void_p, c_uint], self.ps, None, 0)
-            srvs = (c_void_p * 1)(self.mask_srv.value)
-            vcall(ctx, CTX_PS_SET_SRV, None, [c_uint, c_uint, c_void_p], 0, 1, srvs)
-            samplers = (c_void_p * 1)(self.sampler.value)
-            vcall(ctx, CTX_PS_SET_SAMPLERS, None, [c_uint, c_uint, c_void_p], 0, 1, samplers)
-            vcall(ctx, CTX_DRAW, None, [c_uint, c_uint], 3, 0)
-            null = (c_void_p * 1)(None)
-            vcall(ctx, CTX_OM_SET_RT, None, [c_uint, c_void_p, c_void_p], 0, None, None)
-            vcall(ctx, CTX_PS_SET_SRV, None, [c_uint, c_uint, c_void_p], 0, 1, null)
-            check(vcall(self.swapchain, SWAPCHAIN_PRESENT, HRESULT, [c_uint, c_uint], 1, 0), "Present")
         finally:
-            release(rtv)
             release(back)
+        _ = ctx
+
+    def alive(self) -> bool:
+        """False when DirectComposition lost its device (e.g. DWM restarted)."""
+        valid = wintypes.BOOL()
+        hr = vcall(self.dcomp, DCOMP_CHECK_DEVICE_STATE, HRESULT, [POINTER(wintypes.BOOL)], byref(valid))
+        return hr >= 0 and bool(valid.value)
+
+    def show_mask(self, alpha: np.ndarray) -> bool:
+        """Draw the mask (grid-sized array of 0..1) and show the layer; all zero hides it.
+
+        Returns False when the frame could not be presented yet (try again next round)."""
+        if not alpha.any():
+            self.hide()
+            return True
+        data = np.ascontiguousarray(np.clip(alpha * 255.0 + 0.5, 0, 255).astype(np.uint8))
+        ctx = self.gpu.context
+        vcall(
+            ctx,
+            CTX_UPDATE_SUBRESOURCE,
+            None,
+            [c_void_p, c_uint, c_void_p, c_void_p, c_uint, c_uint],
+            self.mask_tex,
+            0,
+            None,
+            data.ctypes.data,
+            data.shape[1],
+            0,
+        )
+        if not self._draw(clear=False):
+            return False  # compositor still busy with the previous frame
+        m = self.monitor
         if not self.visible:
             win32gui.SetWindowPos(
                 self.hwnd,
@@ -460,11 +481,47 @@ class LocalDimmer:
                 win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
             )
             self.visible = True
+        return True
+
+    def _draw(self, clear: bool) -> bool:
+        """Render the mask (or a fully transparent frame) and present it without blocking."""
+        ctx = self.gpu.context
+        m = self.monitor
+        vp = D3D11_VIEWPORT(0, 0, float(m.width), float(m.height), 0.0, 1.0)
+        rtvs = (c_void_p * 1)(self.rtv.value)
+        vcall(ctx, CTX_OM_SET_RT, None, [c_uint, c_void_p, c_void_p], 1, rtvs, None)
+        if clear:
+            zero = (c_float * 4)(0, 0, 0, 0)
+            vcall(ctx, CTX_CLEAR_RTV, None, [c_void_p, c_void_p], self.rtv, zero)
+        else:
+            vcall(ctx, CTX_RS_SET_VIEWPORTS, None, [c_uint, POINTER(D3D11_VIEWPORT)], 1, byref(vp))
+            vcall(ctx, CTX_IA_SET_LAYOUT, None, [c_void_p], None)
+            vcall(ctx, CTX_IA_SET_TOPOLOGY, None, [c_uint], D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+            vcall(ctx, CTX_VS_SET_SHADER, None, [c_void_p, c_void_p, c_uint], self.vs, None, 0)
+            vcall(ctx, CTX_PS_SET_SHADER, None, [c_void_p, c_void_p, c_uint], self.ps, None, 0)
+            srvs = (c_void_p * 1)(self.mask_srv.value)
+            vcall(ctx, CTX_PS_SET_SRV, None, [c_uint, c_uint, c_void_p], 0, 1, srvs)
+            samplers = (c_void_p * 1)(self.sampler.value)
+            vcall(ctx, CTX_PS_SET_SAMPLERS, None, [c_uint, c_uint, c_void_p], 0, 1, samplers)
+            vcall(ctx, CTX_DRAW, None, [c_uint, c_uint], 3, 0)
+            null = (c_void_p * 1)(None)
+            vcall(ctx, CTX_PS_SET_SRV, None, [c_uint, c_uint, c_void_p], 0, 1, null)
+        vcall(ctx, CTX_OM_SET_RT, None, [c_uint, c_void_p, c_void_p], 0, None, None)
+        hr = vcall(self.swapchain, SWAPCHAIN_PRESENT, HRESULT, [c_uint, c_uint], 1, DXGI_PRESENT_DO_NOT_WAIT)
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING:
+            return False
+        check(hr, "Present")
+        return True
 
     def hide(self) -> None:
+        """Clear, then hide: when shown again, an old mask can never flash up for a frame."""
         if self.visible:
-            win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
-            self.visible = False
+            try:
+                self._draw(clear=True)
+            except OSError:
+                pass
+        self.visible = False
+        win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
 
     def _insert_after(self) -> int:
         if self.below is not None and self.below.hwnd:

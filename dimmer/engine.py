@@ -124,6 +124,7 @@ TOPMOST_REFRESH_S = 1.0
 PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
 FINGERPRINT_STEP = 8
 LOCAL_REDRAW_S = 0.033
+LOCAL_FREE_AFTER_S = 30.0
 BLIND_SHARE = 0.9  # share of exactly black tiles that means "cannot see the picture"
 BLIND_AFTER_S = 1.5  # ... held this long (a cut to black in a film is shorter)
 BLIND_LEAVE_SHARE = 0.6
@@ -199,7 +200,7 @@ class _Slot:
         self, monitor: Monitor, index: int, gpu: _GpuContext | None = None, min_interval: float = 0.05
     ) -> None:
         self.monitor = monitor
-        self.min_interval = min_interval  # measuring interval; GPU frames are not needed faster
+        self.min_interval = min(min_interval, 0.033)  # compositor frame cap (bursts/local need ~30/s)
         self.index = index
         self.gpu = gpu
         self.capture: wgc.MonitorCapture | None = None
@@ -211,6 +212,8 @@ class _Slot:
         self.frame_size = (0, 0)
         self.local: LocalDimmer | None = None
         self.local_failed = False
+        self.local_retry_at = 0.0
+        self.local_hidden_at: float | None = None  # hidden since (layer is freed after a while)
         self.mask: np.ndarray | None = None  # what the local layer shows
         self.mask_target: np.ndarray | None = None  # what the current picture asks for
         self._mask_moving = False
@@ -290,9 +293,9 @@ class _Slot:
             now = time.perf_counter()
             due = now - self.processed_at >= process_interval and not self.capture.pending_gpu
             try:
-                had_frame = self.capture.pending
+                submitted = self.capture.submissions
                 result = self.capture.poll(process=due)
-                if due and had_frame:
+                if self.capture.submissions != submitted:
                     self.processed_at = now  # the measuring slot starts with the submission
             except Exception as e:
                 log.warning("%s: GPU-Aufnahme fehlgeschlagen (%s) – wechsle zu GDI", self.monitor.gdi_name, e)
@@ -356,8 +359,8 @@ class _Slot:
         return self.black_since is not None and time.monotonic() - self.black_since >= BLIND_AFTER_S
 
     def blind_pending(self) -> bool:
-        """Black, and the moment it counts as 'protected' is still ahead (keep ticking)."""
-        return self.black_since is not None and not self.blind
+        """Entering or leaving 'protected' is still ahead: keep ticking even without frames."""
+        return (self.black_since is not None and not self.blind) or self.unblack_since is not None
 
     @property
     def dim(self) -> Overlay:
@@ -427,20 +430,26 @@ class _Slot:
     def update_local(self, dt: float, fresh: bool) -> None:
         """New frame: new mask target. Otherwise the picture is unchanged, so the target stays
         (a paused film keeps its bright spot covered) and only a running fade continues."""
-        if self.tiles is None or self.gpu is None or self.local_failed:
+        if self.tiles is None or self.gpu is None:
             return
-        if fresh:
+        if self.local_failed:
+            if time.monotonic() < self.local_retry_at:
+                return
+            self.local_failed = False  # transient problems (session switch, DWM restart) pass
+        if fresh or self.mask_target is None:
+            # self.tiles is always the newest picture: after pause/clear/restart the mask is
+            # restored at once, not only when the picture changes again.
             w, h = self.frame_size
             self.mask_target = local_target(tile_means(self.tiles, w, h), self.stats.background)
-        if self.mask_target is None:
-            return
         now = time.perf_counter()
         if not fresh and now - self._mask_shown_at < LOCAL_REDRAW_S:
             return  # fades are redrawn at ~30 Hz, fast enough to look continuous
         mask = blend_mask(self.mask_target, self.mask, now - self._mask_shown_at if self.mask is not None else dt)
         if self.mask is not None and mask.shape == self.mask.shape and np.allclose(mask, self.mask, atol=0.004):
-            self._mask_moving = False
-            return  # nothing visible would change
+            # Nothing visible changes this round; keep going until the target is reached (the
+            # next step gets a longer dt, so a slow fade still finishes and the layer hides).
+            self._mask_moving = not np.allclose(self.mask, self.mask_target, atol=0.004)
+            return
         self._mask_moving = not np.allclose(mask, self.mask_target, atol=0.004)
         self.mask = mask
         self._mask_shown_at = now
@@ -452,11 +461,13 @@ class _Slot:
             if self.local.grid_h != mask.shape[0] or self.local.grid_w != mask.shape[1]:
                 self.stop_local()
                 return
-            self.local.show_mask(mask)
+            if not self.local.show_mask(mask):
+                self._mask_moving = True  # not presented yet: try again next round
         except Exception as e:
             log.warning("%s: lokales Abdunkeln nicht möglich (%s)", self.monitor.gdi_name, e)
-            self.local_failed = True
             self.stop_local()
+            self.local_failed = True
+            self.local_retry_at = time.monotonic() + WGC_RETRY_S
 
     def stop_local(self) -> None:
         self.mask = self.mask_target = None
@@ -468,6 +479,22 @@ class _Slot:
                 log.debug("local layer close failed", exc_info=True)
             self.local = None
             self.warm.below = self.dim
+
+    def check_local(self) -> None:
+        """Periodic: free a layer hidden for long; rebuild one whose composition device died."""
+        layer = self.local
+        if layer is None:
+            return
+        if layer.visible:
+            self.local_hidden_at = None
+            if not layer.alive():
+                log.info("%s: Composition-Gerät verloren – lokale Ebene wird neu aufgebaut", self.monitor.gdi_name)
+                self.stop_local()
+        elif self.local_hidden_at is None:
+            self.local_hidden_at = time.monotonic()
+        elif time.monotonic() - self.local_hidden_at > LOCAL_FREE_AFTER_S:
+            self.stop_local()
+            self.local_hidden_at = None
 
     def hide_local(self) -> None:
         self.mask = self.mask_target = None
@@ -669,6 +696,7 @@ class Engine(threading.Thread):
                 if now >= next_topmost:
                     for slot in self._slots.values():
                         slot.keep_on_top()
+                        slot.check_local()
                     next_topmost = now + TOPMOST_REFRESH_S
                 if failures:
                     log.info("Messschleife läuft wieder")
@@ -811,7 +839,7 @@ class Engine(threading.Thread):
                 smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
             else:
                 try:
-                    want_tiles = e.glare_weight > 0 or e.protected_opacity > 0
+                    want_tiles = e.glare_weight > 0 or e.glare_local or e.protected_opacity > 0
                     interval = self._settings.interval_ms / 1000.0
                     if slot.local_active:
                         interval = 0.033  # a visible local mask follows every frame (moving light)
@@ -847,8 +875,10 @@ class Engine(threading.Thread):
                         slot.processed_at = 0.0
                     slot.stats = stats
                     slot.track_black(stats)
+                elif slot.unblack_since is not None:
+                    slot.track_black(slot.stats)  # the timeout to leave runs without new frames
                 weight = e.glare_weight
-                if e.glare_local and slot.capture is None:
+                if e.glare_local and (slot.capture is None or slot.local_failed):
                     weight = GLARE_WEIGHTS[2]  # no GPU tiles for a local mask: protect globally instead
                 level = glare_level(slot.stats, weight)
                 if not slot.dim.excluded:
@@ -941,7 +971,7 @@ class Engine(threading.Thread):
         self._settings = s
         if s.interval_ms != old.interval_ms:
             for slot in self._slots.values():
-                slot.min_interval = s.interval_ms / 1000.0
+                slot.min_interval = min(s.interval_ms / 1000.0, 0.033)
                 if slot.capture is not None:
                     slot.capture.set_min_interval(slot.min_interval)
         if s.hotkey != old.hotkey:

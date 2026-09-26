@@ -137,6 +137,7 @@ class MonitorCapture:
         self._inflight = c_void_p()
         self._inflight_size = (0, 0)
         self._submitted_at = 0.0
+        self.submissions = 0
         self.last_frame_at = time.monotonic()
         self.reducer = gpu.reducer()
         interop = _factory("Windows.Graphics.Capture.GraphicsCaptureItem", IID_IGraphicsCaptureItemInterop)
@@ -325,6 +326,7 @@ class MonitorCapture:
             release(surface)
         self._inflight_size = (content.Width, content.Height)
         self._submitted_at = time.monotonic()
+        self.submissions += 1
         return True
 
     def close(self) -> None:

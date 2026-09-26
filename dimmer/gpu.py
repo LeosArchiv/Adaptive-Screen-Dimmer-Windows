@@ -138,6 +138,7 @@ CTX_MAP, CTX_UNMAP, CTX_DISPATCH, CTX_COPY_SUBRESOURCE_REGION, CTX_COPY_RESOURCE
 CTX_FLUSH = 111  # ID3D11DeviceContext::Flush
 DEV_GET_REMOVED_REASON = 39
 FACTORY6_ENUM_BY_PREFERENCE = 29
+ADAPTER_ENUM_OUTPUTS = 7
 D3D_DRIVER_TYPE_UNKNOWN = 0
 D3D11_MAP_FLAG_DO_NOT_WAIT = 0x100000
 DXGI_ERROR_WAS_STILL_DRAWING = -2005270518  # 0x887A000A
@@ -225,29 +226,42 @@ class GpuBrightness:
         self.device, self.context, self.shader = c_void_p(), c_void_p(), c_void_p()
         self._test_reducer: Reducer | None = None
         try:
-            self._create_device()
-            code = _compile_shader()
-            check(
-                vcall(
-                    self.device,
-                    DEV_CREATE_CS,
-                    HRESULT,
-                    [c_char_p, c_size_t, c_void_p, POINTER(c_void_p)],
-                    code,
-                    len(code),
-                    None,
-                    byref(self.shader),
-                ),
-                "CreateComputeShader",
-            )
-            self._protect_multithreaded()
+            self._init(low_power=True)
         except Exception:
-            self.close()
-            raise
+            # e.g. an old integrated GPU without compute shader 5.0: use the default adapter
+            self._release_device()
+            try:
+                self._init(low_power=False)
+            except Exception:
+                self.close()
+                raise
 
-    def _create_device(self) -> None:
+    def _init(self, low_power: bool) -> None:
+        self._create_device(low_power)
+        code = _compile_shader()
+        check(
+            vcall(
+                self.device,
+                DEV_CREATE_CS,
+                HRESULT,
+                [c_char_p, c_size_t, c_void_p, POINTER(c_void_p)],
+                code,
+                len(code),
+                None,
+                byref(self.shader),
+            ),
+            "CreateComputeShader",
+        )
+        self._protect_multithreaded()
+
+    def _release_device(self) -> None:
+        for name in ("shader", "context", "device"):
+            release(getattr(self, name))
+            setattr(self, name, c_void_p())
+
+    def _create_device(self, low_power: bool) -> None:
         """Prefer the low-power GPU: on hybrid laptops the dedicated GPU must not be kept awake."""
-        adapter = _low_power_adapter()
+        adapter = _low_power_adapter() if low_power else c_void_p()
         level = c_uint()
         try:
             check(
@@ -505,7 +519,16 @@ def _low_power_adapter() -> c_void_p:
             byref(IID_IDXGIAdapter1),
             byref(adapter),
         )
-        return adapter if hr >= 0 else c_void_p()
+        if hr < 0:
+            return c_void_p()
+        # Only if a display hangs on it: otherwise every captured frame would have to cross
+        # adapters (e.g. a desktop with an enabled but unused integrated GPU).
+        output = c_void_p()
+        if vcall(adapter, ADAPTER_ENUM_OUTPUTS, HRESULT, [c_uint, POINTER(c_void_p)], 0, byref(output)) < 0:
+            release(adapter)
+            return c_void_p()
+        release(output)
+        return adapter
     except OSError:
         return c_void_p()
     finally:
