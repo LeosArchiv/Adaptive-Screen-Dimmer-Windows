@@ -7,10 +7,16 @@ click-through, multi-monitor, and designed never to flicker.
 ## Features
 - 🛡️ **Flash protection without flicker**: darkens quickly as a soft ramp, brightens again slowly
   after a short hold, and ignores tiny changes – strobing content does not make it pump.
-- 🎯 **Accurate measurement**: the overlay is excluded from screen capture, so it never measures
-  itself; brightness is the exact mean over every pixel (no aliasing on text while scrolling).
-- ⚡ **Reacts to what you do**: a new window, focus change or page title change triggers an
-  immediate measurement; while the screen is still, it measures less often to save CPU.
+- ⚡ **GPU capture, near-zero CPU**: Windows.Graphics.Capture delivers frames only when the screen
+  changes; a D3D11 compute shader reduces each frame to exact per-tile sums, so no image data is
+  copied to the CPU. A flash is seen within ~2 display frames. Automatic GDI fallback.
+- 🎯 **Accurate measurement**: the overlays are excluded from capture, so they never measure
+  themselves; brightness is the exact mean over every pixel (no aliasing on text while scrolling).
+- 🔦 **Glare protection** ("Helle Flecken"): a small very bright area in a dark picture (a
+  flashlight in a dark film scene) is detected by its contrast to the background. *normal/stark*
+  dim the whole screen, *lokal* darkens **only the glaring area** with a soft GPU-drawn mask.
+- 🔒 **Protected video**: DRM video (Netflix & co. in a browser) is black in every screen capture;
+  when a monitor stays exactly black, a per-profile fixed dimming value can apply.
 - 🖥️ **Any number of monitors**: pick them by checkbox with live brightness meters; monitor
   choice survives reboots and re-plugging; hot-plug and resolution changes are handled.
 - ⏸ **Pause anywhere**: global hotkey **Ctrl+Alt+D**, tray icon menu, or the big button.
@@ -57,6 +63,8 @@ Profile settings (each group: *eigene Werte* / *vom Grundprofil übernehmen* / *
 | Stärkste Abdunkelung | how dark it gets at most (capped at 94 %, never black) |
 | Abdunkeln bei Helligkeit | Sofort / Schnell / Sanft – how fast it darkens |
 | Wieder aufhellen | Schnell / Normal / Langsam – how fast it brightens again |
+| Helle Flecken | aus / normal / stark (whole screen) / lokal (only the glaring area) |
+| Geschütztes Video | fixed dimming while the picture cannot be measured (DRM video), off by default |
 | Farbtemperatur / Stärke | blue-light filter: lower kelvin = warmer; strength up to 60 % |
 | Messrate (Optionen) | Sparsam 10/s · Normal 20/s · Schnell 30/s – measurements while the screen changes (half the rate when still); higher = faster flash protection, more CPU |
 
@@ -68,6 +76,10 @@ Log file: `%APPDATA%\AdaptiveScreenDimmer\dimmer.log`.
 - Exclusive-fullscreen games (old DirectX titles) draw above every window; no overlay can cover
   them. Borderless/windowed fullscreen works.
 - Protected screens (UAC prompt, lock screen) cannot be measured; the last state is kept.
+- DRM-protected video is blanked in screen captures: brightness and glare there cannot be
+  measured (see "Geschütztes Video"). Local files (VLC, mpv, …) are not affected.
+- Local dimming lags the picture by about two display frames; fast-moving lights can briefly
+  show an uncovered edge. It needs GPU capture (Windows 10 2004+ with a D3D11 GPU).
 - The blue-light filter is an overlay, not a change of the display's colour pipeline: warm, but
   blacks get slightly lifted at high strength. It works on every monitor and never stays behind.
 - Windows 10 2004 or newer is needed to exclude the overlay from capture; older versions fall
@@ -82,7 +94,8 @@ Log file: `%APPDATA%\AdaptiveScreenDimmer\dimmer.log`.
 .venv\Scripts\python tools\bench_live.py --monitor 0   # latency/CPU with a synthetic flash
 ```
 Architecture: `dimmer/logic.py` (pure measurement and smoothing), `profiles.py` (pure profile,
-rule and schedule resolution), `winapi.py` (monitors, capture, apps per monitor), `overlay.py`, `engine.py` (one thread owns all windows), `gui.py`, `tray.py`, `app.py`.
+rule and schedule resolution), `gpu.py` (D3D11 tile reduction), `wgc.py` (Windows.Graphics.Capture),
+`localdim.py` (DirectComposition mask layer), `winapi.py` (monitors, GDI capture, apps per monitor), `overlay.py`, `engine.py` (one thread owns all windows), `gui.py`, `tray.py`, `app.py`.
 
 ## License
 MIT License — see [LICENSE](LICENSE).
