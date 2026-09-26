@@ -99,7 +99,7 @@ def default_profiles() -> list[Profile]:
         Profile("Arbeit", start=40, full=140, max_opacity=200, attack="Sanft", tint_mode=INHERIT),
         Profile("Zocken", start=30, full=110, max_opacity=230, attack="Sofort", release="Schnell", tint_mode=INHERIT),
         Profile(
-            "Filme", start=60, full=170, max_opacity=160, attack="Sanft", release="Langsam", tint_mode=INHERIT, glare=1
+            "Filme", start=60, full=170, max_opacity=160, attack="Sanft", release="Langsam", tint_mode=INHERIT, glare=3
         ),
         Profile(OFF_PROFILE, dim_mode=OFF, tint_mode=OFF),
     ]
