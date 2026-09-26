@@ -122,3 +122,22 @@ def test_wanted_devices_keeps_connected_choice() -> None:
 def test_wanted_devices_falls_back_when_choice_unplugged() -> None:
     mons = [_mon("a", True)]
     assert wanted_devices(["gone"], mons) == ["a"]
+
+
+def test_list_values_for_names_do_not_reset_everything(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    p.write_text(
+        '{"profiles": [{"name": "Mein", "start": 40}], "rules": [{"exe": "a.exe", "profile": ["x"]}],'
+        ' "schedule": {"day_profile": {"x": 1}, "night_profile": ["y"]}}',
+        encoding="utf-8",
+    )
+    s = load(p)
+    assert s.profile_map()["Mein"].start == 40  # user's profile survived
+    assert s.rules == [] and s.schedule.day_profile == "Mein"
+
+
+def test_unreadable_file_is_kept_as_bad(tmp_path: Path) -> None:
+    p = tmp_path / "settings.json"
+    p.write_text("{broken", encoding="utf-8")
+    load(p)
+    assert (tmp_path / "settings.bad").read_text(encoding="utf-8") == "{broken"

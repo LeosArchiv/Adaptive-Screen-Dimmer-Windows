@@ -82,8 +82,8 @@ class Settings:
 
         rules: dict[str, str] = {}
         for r in s.rules if isinstance(s.rules, list) else []:
-            if isinstance(r, Rule):
-                exe = str(r.exe).strip().lower()
+            if isinstance(r, Rule) and isinstance(r.exe, str) and isinstance(r.profile, str):
+                exe = r.exe.strip().lower()
                 if exe and r.profile in names:
                     rules[exe] = r.profile
         s.rules = [Rule(exe, prof) for exe, prof in sorted(rules.items())]
@@ -92,8 +92,10 @@ class Settings:
         sch = dataclasses.replace(
             sch,
             enabled=sch.enabled if isinstance(sch.enabled, bool) else True,
-            day_profile=sch.day_profile if sch.day_profile in names else first,
-            night_profile=sch.night_profile if sch.night_profile in names else first,
+            day_profile=sch.day_profile if isinstance(sch.day_profile, str) and sch.day_profile in names else first,
+            night_profile=(
+                sch.night_profile if isinstance(sch.night_profile, str) and sch.night_profile in names else first
+            ),
             day_start=format_hhmm(parse_hhmm(sch.day_start, 7 * 60)),
             night_start=format_hhmm(parse_hhmm(sch.night_start, 20 * 60)),
             fade_minutes=clamp(sch.fade_minutes, 0, 180),
@@ -129,6 +131,8 @@ def from_dict(raw: dict[str, Any]) -> Settings:
     if "profiles" not in raw and ("start" in raw or "excluded_apps" in raw):
         raw = _migrate_v1(raw)
     s = Settings()
+    if raw.get("profiles") is not None and not isinstance(raw.get("profiles"), list):
+        raise TypeError("profiles must be a list")
     if isinstance(raw.get("profiles"), list):
         s.profiles = [p for p in (_build(Profile, x) for x in raw["profiles"]) if p]
     if isinstance(raw.get("rules"), list):
@@ -167,14 +171,27 @@ def load(path: Path | None = None) -> Settings:
     path = path or config_dir() / "settings.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return Settings().normalized()
     except (OSError, ValueError):
+        _keep_broken(path)
         return Settings().normalized()
     if not isinstance(raw, dict):
+        _keep_broken(path)
         return Settings().normalized()
     try:
         return from_dict(raw)
     except (TypeError, ValueError, AttributeError):
+        _keep_broken(path)
         return Settings().normalized()
+
+
+def _keep_broken(path: Path) -> None:
+    """Keep an unreadable settings file as .bad before defaults overwrite it."""
+    try:
+        os.replace(path, path.with_suffix(".bad"))
+    except OSError:
+        pass
 
 
 def save(settings: Settings, path: Path | None = None) -> None:

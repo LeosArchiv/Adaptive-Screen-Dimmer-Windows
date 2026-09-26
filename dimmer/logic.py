@@ -30,16 +30,22 @@ def brightness(img: np.ndarray) -> float:
     return float(np.mean(img[..., :3], dtype=np.float64))
 
 
-def compensate(observed: float, alpha: float) -> float:
-    """Undo the darkening of a black overlay with the given alpha that is part of a capture.
+def compensate(observed: float, alpha: float, tint_alpha: float = 0.0, tint_level: float = 0.0) -> float:
+    """Undo overlays that are part of a capture (only when they cannot be excluded from it).
 
-    Only used when the overlay cannot be excluded from screen capture. A black overlay with
-    alpha a turns a pixel value v into v * (1 - a/255).
+    A black overlay with alpha a turns a pixel value v into v * (1 - a/255). A tint overlay
+    below it (alpha t, mean channel value T) first turns v into v * (1 - t/255) + T * t/255.
     """
     visible = 1.0 - max(0.0, min(float(MAX_ALPHA), alpha)) / MAX_ALPHA
     if visible <= 0.02:
         return 255.0
-    return min(255.0, observed / visible)
+    level = observed / visible
+    t = max(0.0, min(float(MAX_ALPHA), tint_alpha)) / MAX_ALPHA
+    if t > 0:
+        if t >= 0.98:
+            return 0.0
+        level = (level - tint_level * t) / (1.0 - t)
+    return max(0.0, min(255.0, level))
 
 
 def target_opacity(level: float, start: float, full: float, max_opacity: float) -> float:

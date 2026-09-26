@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import logging
 import queue
+import re
 import time
 import tkinter as tk
 from collections.abc import Callable
@@ -52,6 +53,7 @@ STALL_S = 3.0
 # Measurements per second while something moves; still screens are measured at half the rate.
 RATE_PRESETS = {"Sparsam (10/s)": 100, "Normal (20/s)": 50, "Schnell (30/s)": 33}
 AUTO_LABEL = "Automatisch (Tag/Nacht)"
+TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 MODE_LABELS = {OWN: "eigene Werte", INHERIT: "vom Grundprofil übernehmen", OFF: "aus"}
 
 
@@ -410,7 +412,8 @@ class DimmerApp:
         ttk.Label(card, text="ab").grid(row=2, column=2, sticky="w")
         ttk.Entry(card, textvariable=self.s_night_at, width=6).grid(row=2, column=3, sticky="w", padx=6)
         for var in (self.s_day_at, self.s_night_at):
-            var.trace_add("write", lambda *_: self._schedule_changed())
+            # only complete "HH:MM" values are applied, never half-typed ones like "1:0"
+            var.trace_add("write", lambda *_: self._schedule_changed() if self._times_complete() else None)
         fade = ttk.Frame(card)
         fade.grid(row=3, column=0, columnspan=4, sticky="we", pady=(6, 0))
         fade.columnconfigure(1, weight=1)
@@ -660,6 +663,9 @@ class DimmerApp:
             text += "\nDiese Regeln werden mit entfernt: " + ", ".join(used)
         if not messagebox.askyesno("Profile", text, parent=self.root):
             return
+        s = self.settings  # may have changed while the dialog was open (tray)
+        if name not in s.profile_map():
+            return
         self._apply(
             dataclasses.replace(
                 s,
@@ -694,12 +700,15 @@ class DimmerApp:
             self._apply(dataclasses.replace(self.settings, rules=rules), reload=True)
 
     # ---- schedule / options ----------------------------------------------------------------
+    def _times_complete(self) -> bool:
+        return all(TIME_RE.fullmatch(v.get().strip()) for v in (self.s_day_at, self.s_night_at))
+
     def _schedule_changed(self) -> None:
         if self._loading:
             return
         sch = self.settings.schedule
         day_at, night_at = self.s_day_at.get().strip(), self.s_night_at.get().strip()
-        valid = parse_hhmm(day_at, -1) >= 0 and parse_hhmm(night_at, -1) >= 0
+        valid = self._times_complete() and parse_hhmm(day_at, -1) >= 0 and parse_hhmm(night_at, -1) >= 0
         new = dataclasses.replace(
             sch,
             enabled=self.s_enabled.get(),
@@ -807,7 +816,10 @@ class DimmerApp:
         self.root.destroy()
 
     def _set_all_bases(self, choice: str) -> None:
-        mp = {} if choice == AUTO else {m.device: choice for m in self._monitor_key}
+        connected = {m.device for m in self._monitor_key}
+        mp = {d: v for d, v in self.settings.monitor_profiles.items() if d not in connected}
+        if choice != AUTO:
+            mp.update({d: choice for d in connected})
         self._apply(dataclasses.replace(self.settings, monitor_profiles=mp))
         self._monitor_key = []  # refresh the comboboxes
 
@@ -883,8 +895,7 @@ class DimmerApp:
                 row.meter.show(0.0, None, None)
                 row.info.config(text="nicht aktiv")
                 continue
-            eff = self._effective_thresholds(m.profile)
-            row.meter.show(m.brightness, *eff)
+            row.meter.show(m.brightness, m.start, m.full)
             parts = [m.profile or "–"]
             if m.app:
                 parts.append(m.app)
@@ -912,14 +923,6 @@ class DimmerApp:
             self._recent_apps = list(st.recent_apps)
             self.r_exe_box.config(values=self._recent_apps)
         self._refresh_schedule_hint()
-
-    def _effective_thresholds(self, label: str) -> tuple[float | None, float | None]:
-        """Meter markers for the profile shown on a monitor (first name of a mix)."""
-        name = label.split(" + ")[0].split(" → ")[0]
-        p = self.settings.profile_map().get(name)
-        if p is None or p.dim_mode != OWN:
-            return (None, None)
-        return (p.start, p.full)
 
     def _refresh_schedule_hint(self) -> None:
         sch = self.settings.schedule

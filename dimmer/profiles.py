@@ -219,7 +219,11 @@ def schedule_phase(schedule: Schedule, minute_of_day: float) -> tuple[str, str, 
     """(from_profile, to_profile, t) for the given time; t is the progress of a running fade."""
     day = parse_hhmm(schedule.day_start, 7 * 60)
     night = parse_hhmm(schedule.night_start, 20 * 60)
-    fade = max(0, min(180, int(schedule.fade_minutes)))
+    if day == night:  # no night at all: never switch (and never jump)
+        return schedule.day_profile, schedule.day_profile, 1.0
+    # A fade never outlasts the shorter phase, otherwise the next switch would cut it off.
+    shorter = min((night - day) % (24 * 60), (day - night) % (24 * 60))
+    fade = max(0, min(180, int(schedule.fade_minutes), shorter))
     now = minute_of_day % (24 * 60)
 
     def since(start: int) -> float:

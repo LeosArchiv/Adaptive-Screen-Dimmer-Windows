@@ -125,3 +125,17 @@ def test_kelvin_colours_get_warmer() -> None:
 
 def test_inherit_mode_constant_used_in_defaults() -> None:
     assert profiles()["Zocken"].tint_mode == INHERIT
+
+
+def test_equal_times_never_switch() -> None:
+    s = Schedule(day_start="20:00", night_start="20:00")
+    for minute in (0, 19 * H + 59, 20 * H, 20 * H + 1, 23 * H):
+        assert schedule_phase(s, minute) == ("Tag", "Tag", 1.0)
+
+
+def test_fade_is_clamped_to_the_shorter_phase() -> None:
+    s = Schedule(day_start="07:00", night_start="07:30", fade_minutes=60)
+    before = schedule_phase(s, 7 * H + 29.9)
+    after = schedule_phase(s, 7 * H + 30)
+    assert before == ("Tag", "Tag", 1.0) or before[2] > 0.99  # the morning fade has finished
+    assert after[:2] == ("Tag", "Nacht") and after[2] == pytest.approx(0.0)

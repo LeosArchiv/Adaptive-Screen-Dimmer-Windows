@@ -94,6 +94,7 @@ class Overlay:
         self.alpha = 0
         self.visible = False
         self.color = color
+        self.below: Overlay | None = None  # keep this window directly under that one
         m = monitor
         self.hwnd = win32gui.CreateWindowEx(
             EX_STYLE,
@@ -137,11 +138,18 @@ class Overlay:
         if self.visible:
             win32gui.UpdateWindow(self.hwnd)
 
+    def _insert_after(self) -> int:
+        # Directly below the partner (the tint must never cover the dimming, the two layers do
+        # not commute), otherwise at the very top of the topmost band.
+        if self.below is not None and self.below.hwnd:
+            return self.below.hwnd
+        return win32con.HWND_TOPMOST
+
     def _show(self) -> None:
         m = self.monitor
         win32gui.SetWindowPos(
             self.hwnd,
-            win32con.HWND_TOPMOST,
+            self._insert_after(),
             m.left,
             m.top,
             m.width,
@@ -149,6 +157,12 @@ class Overlay:
             win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
         )
         self.visible = True
+        win32gui.UpdateWindow(self.hwnd)  # paint before the first composed frame
+
+    def hide(self) -> None:
+        """Hide without touching the alpha first: works even if the alpha call would fail."""
+        self.visible = False
+        win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
 
     def move(self, monitor: Monitor) -> None:
         """Follow a geometry change without recreating the window (no bright flash)."""
@@ -157,11 +171,11 @@ class Overlay:
         flags = win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER
         win32gui.SetWindowPos(self.hwnd, 0, m.left, m.top, m.width, m.height, flags)
 
-    def keep_on_top(self) -> None:
-        if self.visible:
+    def keep_on_top(self, even_hidden: bool = False) -> None:
+        if self.visible or even_hidden:
             win32gui.SetWindowPos(
                 self.hwnd,
-                win32con.HWND_TOPMOST,
+                self._insert_after(),
                 0,
                 0,
                 0,

@@ -165,3 +165,11 @@ def test_deadband_releases_targets_that_round_to_zero() -> None:
     sm.reset(2.6)
     values = run(sm, [0.5] * 40)
     assert round(values[-1]) == 0
+
+
+@pytest.mark.parametrize("true_level", [0, 40, 128, 255])
+def test_compensate_with_tint_below_dimming(true_level: float) -> None:
+    dim, tint, tint_level = 180, 70, 190.0
+    after_tint = true_level * (1 - tint / 255) + tint_level * tint / 255
+    observed = after_tint * (1 - dim / 255)
+    assert compensate(observed, dim, tint, tint_level) == pytest.approx(true_level, abs=1e-6)

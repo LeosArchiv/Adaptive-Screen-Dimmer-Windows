@@ -240,12 +240,7 @@ def _window_pid(hwnd: int) -> int:
     return int(pid.value)
 
 
-_exe_cache: dict[int, str | None] = {}
-
-
 def _exe_name(pid: int) -> str | None:
-    if pid in _exe_cache:
-        return _exe_cache[pid]
     exe = None
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if handle:
@@ -256,17 +251,25 @@ def _exe_name(pid: int) -> str | None:
                 exe = os.path.basename(buf.value).lower()
         finally:
             kernel32.CloseHandle(handle)
-    if len(_exe_cache) > 512:  # pids are reused; keep the cache small and fresh
-        _exe_cache.clear()
-    if exe:
-        _exe_cache[pid] = exe
     return exe
 
 
 UWP_HOST = "applicationframehost.exe"
 
 
+# (hwnd, pid) -> exe. Keyed by both: pids and window handles are each reused by Windows, the pair
+# practically never; entries of vanished windows are dropped on every scan.
+_window_cache: dict[tuple[int, int], str | None] = {}
+
+
 def window_exe(hwnd: int) -> str | None:
+    key = (hwnd, _window_pid(hwnd))
+    if key not in _window_cache:
+        _window_cache[key] = _window_exe_uncached(hwnd)
+    return _window_cache[key]
+
+
+def _window_exe_uncached(hwnd: int) -> str | None:
     """Lower-case exe name owning a top-level window, None if unknown or our own.
 
     Store apps are hosted by ApplicationFrameHost; for those the app's own process (owner of
@@ -306,11 +309,28 @@ user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsIconic.argtypes = [wintypes.HWND]
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetShellWindow.restype = wintypes.HWND
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
+# Shell surfaces that are not "an app open on this monitor": desktop, taskbars, Start/Search,
+# Alt+Tab, Task View, flyouts. They must never switch a monitor's profile.
+SHELL_CLASSES = {
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow",
+    "XamlExplorerHostIslandWindow",
+    "MultitaskingViewFrame",
+    "TaskSwitcherWnd",
+    "ForegroundStaging",
+    "NotifyIconOverflowWindow",
+    "TopLevelWindowForOverflowXamlIsland",
+}
 # Apps must cover at least this share of a monitor to count as "open on" it (skips popups,
 # notifications and small tool windows).
 MIN_COVERAGE = 0.25
@@ -339,30 +359,43 @@ def apps_per_monitor(monitors: list[Monitor]) -> dict[str, str | None]:
     """For each monitor the exe of the topmost real app window on it (None: only desktop)."""
     found: dict[str, str | None] = {}
     rect = wintypes.RECT()
+    shell = user32.GetShellWindow()
+    alive: set[tuple[int, int]] = set()
     for hwnd in top_windows():
         if len(found) == len(monitors):
             break
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        if hwnd == shell or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
             continue
         ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) or _is_cloaked(hwnd):
-            continue
+        if ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) or _is_cloaked(hwnd):
+            continue  # WS_EX_TRANSPARENT: click-through overlays of other tools
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             continue
-        best: Monitor | None = None
-        best_share = 0.0
+        # A window counts on every monitor it covers enough (a window spanning two monitors
+        # applies its profile on both).
+        covered = []
         for m in monitors:
+            if m.device in found:
+                continue
             w = min(rect.right, m.left + m.width) - max(rect.left, m.left)
             h = min(rect.bottom, m.top + m.height) - max(rect.top, m.top)
-            if w <= 0 or h <= 0:
-                continue
-            share = w * h / float(m.width * m.height)
-            if share > best_share:
-                best, best_share = m, share
-        if best is None or best.device in found or best_share < MIN_COVERAGE:
+            if w > 0 and h > 0 and w * h / float(m.width * m.height) >= MIN_COVERAGE:
+                covered.append(m)
+        if not covered:
             continue
-        exe = window_exe(hwnd)
-        if exe is None and _window_pid(hwnd) == os.getpid():
+        try:
+            if win32gui.GetClassName(hwnd) in SHELL_CLASSES:
+                continue
+        except win32gui.error:
+            continue
+        pid = _window_pid(hwnd)
+        if pid == os.getpid():
             continue  # our own window: look at what is underneath
-        found[best.device] = exe
+        alive.add((hwnd, pid))
+        exe = window_exe(hwnd)
+        for m in covered:
+            found[m.device] = exe
+    for key in [k for k in _window_cache if k not in alive]:
+        if len(_window_cache) > 64:
+            _window_cache.pop(key, None)
     return found

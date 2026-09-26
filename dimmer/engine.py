@@ -88,6 +88,7 @@ KELVIN_RATE = 3000.0  # kelvin per second
 MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
 PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
+APP_CONFIRM = 2  # consecutive sightings before a monitor switches to another app's profile
 IDLE_AFTER_S = 2.0  # screen unchanged this long -> slower measuring
 IDLE_FACTOR = 2.0  # at most 100 ms extra latency for a flash after a still phase
 IDLE_INTERVAL_MAX_S = 0.25  # while paused
@@ -110,6 +111,8 @@ class MonitorStatus:
     reason: str = ""  # e.g. "Programm ddnet.exe", "Zeitplan"
     app: str | None = None  # app in front on this monitor
     tint: float = 0.0  # current blue-light filter strength in percent
+    start: float | None = None  # thresholds in effect (None: dimming off), for the meter
+    full: float | None = None
 
 
 @dataclass
@@ -137,7 +140,8 @@ class _Slot:
         self.tint: Overlay | None = None
         try:
             self.tint = Overlay(monitor, kelvin_to_rgb(3400))
-            self.overlay = Overlay(monitor)  # created last = above the tint
+            self.overlay = Overlay(monitor)
+            self.tint.below = self.overlay  # the tint always stays directly under the dimming
         except Exception:
             self.close()
             raise
@@ -147,6 +151,9 @@ class _Slot:
         self.capture_failures = 0
         self.effective = Effective()
         self.app: str | None = None
+        self.app_known = False
+        self.pending_app: str | None = None
+        self.pending_hits = 0
         self.tint_strength = 0.0  # current, fades toward effective.tint_strength
         self.tint_kelvin = 3400.0
 
@@ -175,10 +182,11 @@ class _Slot:
         self.sampler.close()
         self.sampler = sampler
 
-    def tint_moving(self) -> bool:
+    def tint_moving(self, paused: bool = False) -> bool:
         e = self.effective
-        return abs(self.tint_strength - e.tint_strength) > 0.05 or (
-            e.tint_on and abs(self.tint_kelvin - e.tint_kelvin) > 1
+        goal = 0.0 if paused else e.tint_strength
+        return abs(self.tint_strength - goal) > 0.05 or (
+            not paused and e.tint_on and abs(self.tint_kelvin - e.tint_kelvin) > 1
         )
 
     def step_tint(self, dt: float, off: bool) -> None:
@@ -191,16 +199,22 @@ class _Slot:
         self.warm.set_alpha(round(self.tint_strength / 100 * 255))
 
     def keep_on_top(self) -> None:
+        # Dimming first (even while hidden, so its z position is always the reference), then the
+        # tint directly below it: the tint never covers the dimming, not even for a frame.
+        self.dim.keep_on_top(even_hidden=True)
         self.warm.keep_on_top()
-        self.dim.keep_on_top()  # dimming stays above the tint
 
     def clear(self) -> None:
+        """Fail-safe: hide both layers; each one independently of the other."""
         self.smoother.reset(0.0)
         self.tint_strength = 0.0
-        if self.overlay:
-            self.overlay.set_alpha(0)
-        if self.tint:
-            self.tint.set_alpha(0)
+        for layer in (self.overlay, self.tint):
+            if layer is None:
+                continue
+            try:
+                layer.hide()
+            except Exception:
+                log.debug("could not hide overlay", exc_info=True)
 
     def close(self) -> None:
         if self.overlay:
@@ -414,7 +428,7 @@ class Engine(threading.Thread):
                 log.debug("pump failed during backoff", exc_info=True)
 
     def _any_moving(self) -> bool:
-        return any(not slot.smoother.settled or slot.tint_moving() for slot in self._slots.values())
+        return any(not slot.smoother.settled or slot.tint_moving(self._paused) for slot in self._slots.values())
 
     def _current_interval(self, calm_for: float) -> float:
         """Full rate while anything moves; a slower rate once every monitor has been still."""
@@ -454,7 +468,9 @@ class Engine(threading.Thread):
                     continue
                 if not slot.dim.excluded:
                     # The alpha set one tick (>= 16 ms, several frames) ago is what the capture shows.
-                    level = compensate(level, slot.dim.alpha)
+                    tint = slot.warm
+                    tint_alpha = 0 if tint.excluded or not tint.visible else tint.alpha
+                    level = compensate(level, slot.dim.alpha, tint_alpha, sum(tint.color) / 3)
                 if abs(level - slot.level) > CALM_THRESHOLD:
                     active = True
                 slot.level = level
@@ -462,7 +478,7 @@ class Engine(threading.Thread):
                 smoother.step(slot.target, dt)
             slot.dim.set_alpha(round(smoother.value))
             slot.step_tint(dt, off=self._paused)
-            if not smoother.settled or slot.tint_moving():
+            if not smoother.settled or slot.tint_moving(self._paused):
                 active = True
         self._publish()
         return active
@@ -536,7 +552,7 @@ class Engine(threading.Thread):
         lt = time.localtime()
         minute = lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60
         for device, slot in self._slots.items():
-            app = apps.get(device)
+            app = self._confirmed_app(slot, apps.get(device))
             if app and (not self._recent_apps or self._recent_apps[0] != app):
                 if app in self._recent_apps:
                     self._recent_apps.remove(app)
@@ -545,11 +561,29 @@ class Engine(threading.Thread):
             if effective.label != slot.effective.label:
                 log.info("%s: Profil %s (%s)", slot.monitor.gdi_name, effective.label, effective.reason)
             if effective != slot.effective:
+                old = slot.effective
                 slot.effective = effective
                 slot.smoother.attack = ATTACK_PRESETS[effective.attack]
                 slot.smoother.release = RELEASE_PRESETS[effective.release]
-                self._wake_now = True
-            slot.app = app
+                # Wake only for real switches, not for every step of a slow day/night fade.
+                if (old.label, old.dim_on, old.tint_on) != (effective.label, effective.dim_on, effective.tint_on):
+                    self._wake_now = True
+
+    @staticmethod
+    def _confirmed_app(slot: _Slot, seen: str | None) -> str | None:
+        """Accept a new app in front only when seen twice in a row (~0.25 s): Start menu,
+        Alt+Tab and similar short-lived windows must not make the profile flip back and forth."""
+        if not slot.app_known:
+            slot.app, slot.app_known = seen, True
+        elif seen == slot.app:
+            slot.pending_hits = 0
+        elif seen == slot.pending_app:
+            slot.pending_hits += 1
+            if slot.pending_hits >= APP_CONFIRM:
+                slot.app, slot.pending_hits = seen, 0
+        else:
+            slot.pending_app, slot.pending_hits = seen, 1
+        return slot.app
 
     def _refresh_monitors(self, force: bool = False) -> None:
         monitors = list_monitors()
@@ -592,6 +626,8 @@ class Engine(threading.Thread):
                 reason=slot.effective.reason,
                 app=slot.app,
                 tint=slot.tint_strength,
+                start=slot.effective.start if slot.effective.dim_on else None,
+                full=slot.effective.full if slot.effective.dim_on else None,
             )
             for d, slot in sorted(self._slots.items(), key=lambda kv: index.get(kv[0], 99))
         ]
