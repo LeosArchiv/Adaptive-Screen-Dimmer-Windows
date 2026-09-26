@@ -126,6 +126,11 @@ FINGERPRINT_STEP = 8
 LOCAL_REDRAW_S = 0.033
 BLIND_SHARE = 0.9  # share of exactly black tiles that means "cannot see the picture"
 BLIND_AFTER_S = 1.5  # ... held this long (a cut to black in a film is shorter)
+BLIND_LEAVE_SHARE = 0.6
+BLIND_LEAVE_S = 1.0
+BURST_DELTA = 8.0  # brightness change (0..255) between two measurements that starts a burst
+WGC_WATCHDOG_S = 15.0  # GPU capture without any frame this long: restart it (it may be dead)
+WM_POWERBROADCAST = 0x0218
 WGC_RETRY_S = 30.0  # a monitor that fell back to GDI tries GPU capture again after this
 STATUS_REFRESH_S = 0.25
 WGC_MIN_INTERVAL_S = 0.016  # GPU capture: polling is nearly free, so poll up to ~60x per second
@@ -199,6 +204,7 @@ class _Slot:
         self.gpu = gpu
         self.capture: wgc.MonitorCapture | None = None
         self.wgc_retry_at = 0.0
+        self.wgc_failures = 0
         self.processed_at = 0.0
         self.stats = FrameStats.flat(0.0)
         self.tiles: np.ndarray | None = None  # last GPU tile sums (for local dimming)
@@ -210,6 +216,7 @@ class _Slot:
         self._mask_moving = False
         self._mask_shown_at = 0.0
         self.black_since: float | None = None  # picture exactly black (protected video?) since
+        self.unblack_since: float | None = None
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
         self.sampler = Sampler()
@@ -243,18 +250,26 @@ class _Slot:
     def backend(self) -> str:
         return "GPU" if self.capture else "GDI"
 
-    def start_gpu_capture(self) -> None:
+    def start_gpu_capture(self, quiet: bool = False) -> None:
         if self.gpu is None or self.capture is not None:
             return
+        if not self.dim.excluded:
+            return  # overlay would be in the frames: the GDI path with compensation handles that
         try:
             self.capture = wgc.MonitorCapture(self.gpu.gpu, self.gpu.device, self.monitor.hmonitor)
             self.capture.set_min_interval(self.min_interval)
             self.forget_frame()
-            log.info("%s: GPU-Aufnahme (Windows.Graphics.Capture)", self.monitor.gdi_name)
+            self.computed_for = None
+            self.wgc_failures = 0
+            (log.debug if quiet else log.info)("%s: GPU-Aufnahme (Windows.Graphics.Capture)", self.monitor.gdi_name)
         except Exception as e:
             self.capture = None
+            self.wgc_failures += 1
             self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
-            log.warning("%s: GPU-Aufnahme nicht möglich (%s) – GDI wird genutzt", self.monitor.gdi_name, e)
+            # warn once; later retries of the same problem go to the debug log only
+            (log.debug if quiet or self.wgc_failures > 1 else log.warning)(
+                "%s: GPU-Aufnahme nicht möglich (%s) – GDI wird genutzt", self.monitor.gdi_name, e
+            )
 
     def stop_gpu_capture(self) -> None:
         if self.capture is not None:
@@ -273,17 +288,19 @@ class _Slot:
         """
         if self.capture is not None:
             now = time.perf_counter()
-            due = now - self.processed_at >= process_interval
+            due = now - self.processed_at >= process_interval and not self.capture.pending_gpu
             try:
+                had_frame = self.capture.pending
                 result = self.capture.poll(process=due)
+                if due and had_frame:
+                    self.processed_at = now  # the measuring slot starts with the submission
             except Exception as e:
                 log.warning("%s: GPU-Aufnahme fehlgeschlagen (%s) – wechsle zu GDI", self.monitor.gdi_name, e)
                 self.stop_gpu_capture()
                 self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
             else:
                 if result is None:
-                    return None  # nothing new, or a new frame waits for its measuring slot
-                self.processed_at = now
+                    return None  # nothing new, or a frame waits for its slot / the GPU
                 tiles, w, h = result
                 self.tiles, self.frame_size = tiles, (w, h)
                 return frame_stats(tiles, w, h)
@@ -316,9 +333,20 @@ class _Slot:
 
     # ---- protected (unmeasurable) content ----------------------------------------------------
     def track_black(self, stats: FrameStats) -> None:
+        """Enter 'unmeasurable' after >= 90 % exact black for 1.5 s; leave it only when clearly
+        less is black (< 60 %) for 1 s, so player controls fading in and out do not pump."""
+        now = time.monotonic()
         if stats.black_share >= BLIND_SHARE:
+            self.unblack_since = None
             if self.black_since is None:
-                self.black_since = time.monotonic()
+                self.black_since = now
+        elif self.blind and stats.black_share >= BLIND_LEAVE_SHARE:
+            self.unblack_since = None  # still mostly black: stay
+        elif self.blind:
+            if self.unblack_since is None:
+                self.unblack_since = now
+            elif now - self.unblack_since >= BLIND_LEAVE_S:
+                self.black_since = self.unblack_since = None
         else:
             self.black_since = None
 
@@ -343,6 +371,11 @@ class _Slot:
 
     def update_geometry(self, monitor: Monitor, index: int) -> None:
         self.index = index
+        if monitor.hmonitor != self.monitor.hmonitor and monitor == self.monitor:
+            self.monitor = monitor  # same place, new handle (e.g. after sleep): capture anew
+            self.stop_gpu_capture()
+            self.start_gpu_capture(quiet=True)
+            return
         if monitor != self.monitor:
             sampler = Sampler()  # swap only once the new one exists
             self.warm.move(monitor)
@@ -359,6 +392,7 @@ class _Slot:
         sampler = Sampler()
         self.sampler.close()
         self.sampler = sampler
+        self.forget_frame()
 
     def tint_moving(self, paused: bool = False) -> bool:
         e = self.effective
@@ -444,6 +478,7 @@ class _Slot:
     def clear(self) -> None:
         """Fail-safe: hide both layers; each one independently of the other."""
         self.smoother.reset(0.0)
+        self.computed_for = None
         self.tint_strength = 0.0
         self.mask = self.mask_target = None
         self._mask_moving = False
@@ -507,6 +542,7 @@ class Engine(threading.Thread):
         self._hook_proc = WinEventProc(self._on_win_event)
         self._gpu: _GpuContext | None = None
         self._timer = 0  # high-resolution waitable timer, created on the engine thread
+        self._resume_pending = False
         self._published_key: tuple = ()
         self._published_at = 0.0
         self.use_gpu = True  # tests can force the GDI path
@@ -610,6 +646,11 @@ class Engine(threading.Thread):
                     next_monitor_check = now + MONITOR_CHECK_S
                     self._refresh_monitors(force=self._force_refresh)
                     self._force_refresh = False
+                    if self._resume_pending:  # after sleep every capture session is suspect
+                        self._resume_pending = False
+                        for slot in self._slots.values():
+                            slot.stop_gpu_capture()
+                            slot.start_gpu_capture(quiet=True)
                     self._retry_gpu_captures()
                 if now >= next_fg:
                     self._resolve_profiles()
@@ -690,10 +731,38 @@ class Engine(threading.Thread):
             log.warning("GPU-Aufnahme nicht verfügbar (%s) – GDI wird genutzt", e)
 
     def _retry_gpu_captures(self) -> None:
+        """Rebuild a lost GPU device, restart dead or stale captures, retry fallen-back monitors."""
+        if self._gpu is not None and self._gpu.gpu.is_lost():
+            log.warning("Grafikkarte zurückgesetzt – GPU-Aufnahme wird neu aufgebaut")
+            self._restart_gpu()
+            return
         now = time.monotonic()
         for slot in self._slots.values():
-            if self._gpu and slot.capture is None and now >= slot.wgc_retry_at:
-                slot.start_gpu_capture()
+            cap = slot.capture
+            if cap is not None and now - cap.last_frame_at > WGC_WATCHDOG_S and not self._paused:
+                # No frame for a long time: a still screen, or a dead capture (monitor handle
+                # changed, resume from sleep). A new session always delivers a current frame.
+                slot.stop_gpu_capture()
+                slot.start_gpu_capture(quiet=True)
+            elif self._gpu and cap is None and now >= slot.wgc_retry_at:
+                slot.start_gpu_capture(quiet=slot.wgc_failures > 0)
+
+    def _restart_gpu(self) -> None:
+        for slot in self._slots.values():
+            slot.stop_local()
+            slot.stop_gpu_capture()
+            slot.gpu = None
+        if self._gpu is not None:
+            try:
+                self._gpu.close()
+            except Exception:
+                log.debug("GPU close failed", exc_info=True)
+            self._gpu = None
+        self._start_gpu()
+        for slot in self._slots.values():
+            slot.gpu = self._gpu
+            slot.local_failed = False
+            slot.start_gpu_capture()
 
     def _all_gpu(self) -> bool:
         return bool(self._slots) and all(slot.capture is not None for slot in self._slots.values())
@@ -727,10 +796,16 @@ class Engine(threading.Thread):
         for slot in self._slots.values():
             e = slot.effective
             smoother = slot.smoother
+            if (self._paused or not e.dim_on) and slot.capture is not None:
+                try:
+                    slot.capture.poll(process=False)  # keep the pool drained: no stale frames later
+                except Exception:
+                    log.debug("drain failed", exc_info=True)
             if self._paused:
                 slot.target = 0.0
                 smoother.reset(0.0)  # user asked for it: off at once
                 slot.tint_strength = 0.0
+                slot.computed_for = None  # on resume the target is recomputed, frame or not
             elif not e.dim_on:
                 slot.target = 0.0
                 smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
@@ -741,7 +816,9 @@ class Engine(threading.Thread):
                     if slot.local_active:
                         interval = 0.033  # a visible local mask follows every frame (moving light)
                     stats = slot.sample(want_tiles, interval)
-                    slot.capture_failures = 0
+                    if slot.capture_failures:
+                        slot.capture_failures = 0
+                        slot.computed_for = None  # capture is back: recompute even if unchanged
                 except OSError as err:  # e.g. secure desktop (UAC, lock screen): keep last state
                     self._capture_failed(slot, err)
                     if slot.capture_failures >= CAPTURE_RENEW_AFTER:
@@ -761,6 +838,13 @@ class Engine(threading.Thread):
                     continue  # fast path: no new frame, nothing moving, same profile -> no work
                 slot.computed_for = e
                 if stats is not None:
+                    if (
+                        abs(stats.mean - slot.stats.mean) > BURST_DELTA
+                        or abs(stats.spot - slot.stats.spot) > BURST_DELTA
+                    ):
+                        # The picture is in the middle of a big change (a page loading, a flash):
+                        # measure the next frame at once instead of waiting for the measuring slot.
+                        slot.processed_at = 0.0
                     slot.stats = stats
                     slot.track_black(stats)
                 weight = e.glare_weight
@@ -776,11 +860,11 @@ class Engine(threading.Thread):
                     active = True
                 slot.level = level
                 slot.target = target_opacity(level, e.start, e.full, e.max_opacity)
-                if slot.blind and e.protected_opacity > 0:
+                if slot.blind and e.protected_opacity > 0 and e.dim_on:
                     # The capture sees only black (DRM-protected video is blanked in every
                     # screen capture): the picture cannot be measured, so the profile's fixed
                     # protection applies instead of "no dimming".
-                    slot.target = max(slot.target, e.protected_opacity)
+                    slot.target = max(slot.target, min(e.protected_opacity, e.max_opacity))
                 smoother.step(slot.target, dt)
                 if e.glare_local and slot.capture is not None:
                     slot.update_local(dt, fresh=stats is not None)
@@ -799,6 +883,7 @@ class Engine(threading.Thread):
 
     def _capture_failed(self, slot: _Slot, error: OSError) -> None:
         slot.capture_failures += 1
+        slot.computed_for = None
         log.debug("capture failed on %s: %s", slot.monitor.gdi_name, error)
         if slot.capture_failures % CAPTURE_RENEW_AFTER == 0:
             # Persistent failure (not just a short UAC prompt): get a fresh screen DC and, so a
@@ -871,6 +956,8 @@ class Engine(threading.Thread):
         if paused != self._paused:
             self._paused = paused
             log.info("Pausiert" if paused else "Fortgesetzt")
+            for slot in self._slots.values():
+                slot.computed_for = None  # the target must be recomputed, even without a new frame
         self._wake_now = True
         self._publish()
 
@@ -949,7 +1036,9 @@ class Engine(threading.Thread):
             for s in self._slots.values()
         )
         now = time.monotonic()
-        if key != self._published_key or now - self._published_at >= STATUS_REFRESH_S:
+        if (
+            key != self._published_key and now - self._published_at >= 0.05
+        ) or now - self._published_at >= STATUS_REFRESH_S:
             self._published_key, self._published_at = key, now
             self._publish()
 
@@ -985,6 +1074,8 @@ class Engine(threading.Thread):
     # ---- Win32 plumbing ----------------------------------------------------------------
     def _on_window_message(self, msg: int, _wp: int, _lp: int) -> None:
         self._monitors_dirty = True
+        if msg == WM_POWERBROADCAST:
+            self._resume_pending = True
         clear_monitor_id_cache()
 
     def _on_win_event(self, _hook, event, hwnd, id_object, _child, _thread, _time) -> None:

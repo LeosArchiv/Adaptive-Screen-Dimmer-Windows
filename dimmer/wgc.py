@@ -11,6 +11,7 @@ Must be used from one thread (the engine thread); that thread must initialise Wi
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import POINTER, byref, c_int32, c_uint, c_void_p, wintypes
 
 import numpy as np
@@ -40,7 +41,8 @@ IID_IDxgiInterfaceAccess = GUID.parse("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")
 IID_IDirect3DDevice = GUID.parse("A37624AB-8D5F-4650-9D3E-9EAE3D9BC670")
 
 PIXEL_FORMAT_B8G8R8A8 = 87
-BUFFERS = 2
+BUFFERS = 3  # newest frame held + one being reduced + one free for the compositor
+MAX_GPU_WAIT_S = 0.1
 
 
 class SizeInt32(ctypes.Structure):
@@ -132,6 +134,11 @@ class MonitorCapture:
         self.device = device
         self.item = self.pool = self.session = c_void_p()
         self._held = c_void_p()
+        self._inflight = c_void_p()
+        self._inflight_size = (0, 0)
+        self._submitted_at = 0.0
+        self.last_frame_at = time.monotonic()
+        self.reducer = gpu.reducer()
         interop = _factory("Windows.Graphics.Capture.GraphicsCaptureItem", IID_IGraphicsCaptureItemInterop)
         try:
             item = c_void_p()
@@ -180,6 +187,10 @@ class MonitorCapture:
             )
             self.session = session
             self.border_hidden = self._set_flag(IID_ISession3, False)  # no yellow capture border
+            if not self.border_hidden:
+                # Windows 10: the border cannot be switched off. A permanent yellow frame around
+                # every monitor is not acceptable, so the caller falls back to GDI capture.
+                raise GpuError("capture border cannot be hidden on this Windows version")
             self._set_flag(IID_ISession2, False)  # no mouse cursor in the frames
             self.throttled = False
             check(vcall(self.session, 6, HRESULT, []), "StartCapture")
@@ -215,42 +226,64 @@ class MonitorCapture:
             release(iface)
 
     def poll(self, process: bool = True) -> tuple[np.ndarray, int, int] | None:
-        """(tile sums, width, height) of the newest frame, or None.
+        """(tile sums, width, height) of a newly measured frame, or None.
 
         Frames are drained on every call and only the newest one is kept, so no buffer ever
-        fills up and the final state of a change is never dropped. It is measured (the GPU
-        work) only when ``process`` is true; otherwise it waits for the next measuring slot.
+        fills up and the final state of a change is never dropped. When ``process`` is true the
+        newest frame is handed to the GPU; its result is picked up by a later call without
+        waiting (a busy GPU never stalls the engine thread).
         """
         while True:
             frame = c_void_p()
             check(vcall(self.pool, 7, HRESULT, [POINTER(c_void_p)], byref(frame)), "TryGetNextFrame")
             if not frame.value:
                 break
-            self._drop_held()
+            self.last_frame_at = time.monotonic()
+            _drop(self._held)
             self._held = frame
-        if not process or not self._held.value:
-            return None
-        try:
-            return self._measure(self._held)
-        finally:
-            self._drop_held()
+        if self._inflight.value:
+            waited = time.monotonic() - self._submitted_at
+            tiles = self.reducer.collect(wait=waited > MAX_GPU_WAIT_S)
+            if tiles is None:
+                return None
+            w, h = self._inflight_size
+            _drop(self._inflight)
+            self._inflight = c_void_p()
+            return tiles, w, h
+        if process and self._held.value:
+            frame, self._held = self._held, c_void_p()
+            if self._submit(frame):
+                self._inflight = frame
+                tiles = self.reducer.collect(wait=False)  # often already done for small frames
+                if tiles is not None:
+                    w, h = self._inflight_size
+                    _drop(self._inflight)
+                    self._inflight = c_void_p()
+                    return tiles, w, h
+            else:
+                _drop(frame)
+        return None
+
+    @property
+    def pending_gpu(self) -> bool:
+        """A measurement is still being computed on the GPU."""
+        return bool(self._inflight.value)
 
     @property
     def pending(self) -> bool:
-        """A newer frame is waiting to be measured."""
-        return bool(self._held.value)
+        """A newer frame is waiting to be measured, or a measurement is still on the GPU."""
+        return bool(self._held.value or self._inflight.value)
 
-    def _drop_held(self) -> None:
-        if self._held.value:
-            _close(self._held)
-            release(self._held)
-            self._held = c_void_p()
-
-    def _measure(self, frame: c_void_p) -> tuple[np.ndarray, int, int]:
+    def _submit(self, frame: c_void_p) -> bool:
+        """Queue the GPU reduction of a frame. False when the frame must be skipped."""
         content = SizeInt32()
         check(vcall(frame, 8, HRESULT, [POINTER(SizeInt32)], byref(content)), "ContentSize")
-        if (content.Width, content.Height) != (self.size.Width, self.size.Height) and content.Width > 0:
-            self.size = content  # resolution changed: new buffers for the next frames
+        if content.Width <= 0 or content.Height <= 0:
+            return False
+        if (content.Width, content.Height) != (self.size.Width, self.size.Height):
+            # Resolution changed: this frame's texture still has the old size. Resize the pool
+            # and measure from the next frame on instead of reading outside the texture.
+            self.size = content
             check(
                 vcall(
                     self.pool,
@@ -264,6 +297,7 @@ class MonitorCapture:
                 ),
                 "Recreate",
             )
+            return False
         surface = c_void_p()
         check(vcall(frame, 6, HRESULT, [POINTER(c_void_p)], byref(surface)), "Surface")
         try:
@@ -284,16 +318,20 @@ class MonitorCapture:
             finally:
                 release(access)
             try:
-                w = max(1, min(content.Width, self.size.Width))
-                h = max(1, min(content.Height, self.size.Height))
-                return self.gpu.tiles_of_texture(texture, w, h, full_copy=False), w, h
+                self.reducer.submit(texture, content.Width, content.Height)
             finally:
                 release(texture)
         finally:
             release(surface)
+        self._inflight_size = (content.Width, content.Height)
+        self._submitted_at = time.monotonic()
+        return True
 
     def close(self) -> None:
-        self._drop_held()
+        _drop(self._held)
+        _drop(self._inflight)
+        self._held = self._inflight = c_void_p()
+        self.reducer.close()
         for name in ("session", "pool"):
             obj = getattr(self, name)
             _close(obj)
@@ -301,6 +339,13 @@ class MonitorCapture:
             setattr(self, name, c_void_p())
         release(self.item)
         self.item = c_void_p()
+
+
+def _drop(frame: c_void_p) -> None:
+    """Return a frame to the pool."""
+    if frame.value:
+        _close(frame)
+        release(frame)
 
 
 __all__ = ["GpuError", "MonitorCapture", "WinrtDevice", "init_thread", "is_supported"]

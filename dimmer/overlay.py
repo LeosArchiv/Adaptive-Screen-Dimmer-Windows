@@ -38,7 +38,8 @@ def set_message_hook(hook: Callable[[int, int, int], None] | None) -> None:
 WM_DISPLAYCHANGE = 0x007E
 WM_DPICHANGED = 0x02E0
 WM_SETTINGCHANGE = 0x001A
-WATCHED_MESSAGES = (WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE)
+WM_POWERBROADCAST = 0x0218  # resume from sleep
+WATCHED_MESSAGES = (WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE, WM_POWERBROADCAST)
 
 
 def _wnd_proc(hwnd: int, msg: int, wp: int, lp: int) -> int:
