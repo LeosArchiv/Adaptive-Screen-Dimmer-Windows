@@ -26,6 +26,7 @@ from .gpu import GpuBrightness
 from .logic import (
     ATTACK_PRESETS,
     RELEASE_PRESETS,
+    FrameStats,
     Smoother,
     brightness,
     compensate,
@@ -118,6 +119,8 @@ MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
 PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
 FINGERPRINT_STEP = 8
+BLIND_SHARE = 0.9  # share of exactly black tiles that means "cannot see the picture"
+BLIND_AFTER_S = 1.5  # ... held this long (a cut to black in a film is shorter)
 WGC_RETRY_S = 30.0  # a monitor that fell back to GDI tries GPU capture again after this
 STATUS_REFRESH_S = 0.25
 WGC_MIN_INTERVAL_S = 0.016  # GPU capture: polling is nearly free, so poll up to ~60x per second
@@ -148,6 +151,7 @@ class MonitorStatus:
     full: float | None = None
     spot: float = 0.0  # brightest 128 px block
     capture: str = ""  # "GPU" (Windows.Graphics.Capture) or "GDI" (fallback)
+    protected: bool = False  # picture unmeasurable (exactly black), probably protected video
 
 
 @dataclass
@@ -191,8 +195,8 @@ class _Slot:
         self.capture: wgc.MonitorCapture | None = None
         self.wgc_retry_at = 0.0
         self.processed_at = 0.0
-        self.mean = 0.0
-        self.spot = 0.0
+        self.stats = FrameStats.flat(0.0)
+        self.black_since: float | None = None  # picture exactly black (protected video?) since
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
         self.sampler = Sampler()
@@ -247,8 +251,8 @@ class _Slot:
                 log.debug("capture close failed", exc_info=True)
             self.capture = None
 
-    def sample(self, want_spot: bool, process_interval: float) -> tuple[float, float] | None:
-        """(mean, brightest block) of the current picture, or None when it did not change.
+    def sample(self, want_tiles: bool, process_interval: float) -> FrameStats | None:
+        """Statistics of the current picture, or None when it did not change.
 
         GPU capture: polled at display rate, but measured at most every ``process_interval``
         (continuous change such as video would otherwise cost GPU work 60x per second). The
@@ -270,9 +274,9 @@ class _Slot:
                 tiles, w, h = result
                 return frame_stats(tiles, w, h)
         m = self.monitor
-        return self._sample_gdi(self.sampler.grab(m.left, m.top, m.width, m.height), want_spot)
+        return self._sample_gdi(self.sampler.grab(m.left, m.top, m.width, m.height), want_tiles)
 
-    def _sample_gdi(self, pixels: np.ndarray, want_spot: bool) -> tuple[float, float] | None:
+    def _sample_gdi(self, pixels: np.ndarray, want_tiles: bool) -> FrameStats | None:
         """GDI fallback: exact values, skipped when the frame is unchanged.
 
         A fixed coarse grid (every 8th pixel) is compared with the previous frame first; the
@@ -282,20 +286,36 @@ class _Slot:
         fingerprint = pixels[::FINGERPRINT_STEP, ::FINGERPRINT_STEP, :3]
         if (
             self._fingerprint is not None
-            and self._fingerprint_spot == want_spot
+            and self._fingerprint_spot == want_tiles
             and np.array_equal(fingerprint, self._fingerprint)
         ):
             return None
         self._fingerprint = fingerprint.copy()
-        self._fingerprint_spot = want_spot
-        if want_spot:
+        self._fingerprint_spot = want_tiles
+        if want_tiles:  # tile statistics cost more on the CPU: only when a profile needs them
             h, w = pixels.shape[:2]
             return frame_stats(tile_sums(pixels), w, h)
-        mean = brightness(pixels)
-        return mean, mean
+        return FrameStats.flat(brightness(pixels))
 
     def forget_frame(self) -> None:
         self._fingerprint = None
+
+    # ---- protected (unmeasurable) content ----------------------------------------------------
+    def track_black(self, stats: FrameStats) -> None:
+        if stats.black_share >= BLIND_SHARE:
+            if self.black_since is None:
+                self.black_since = time.monotonic()
+        else:
+            self.black_since = None
+
+    @property
+    def blind(self) -> bool:
+        """Picture has been exactly black for a while: most likely protected video."""
+        return self.black_since is not None and time.monotonic() - self.black_since >= BLIND_AFTER_S
+
+    def blind_pending(self) -> bool:
+        """Black, and the moment it counts as 'protected' is still ahead (keep ticking)."""
+        return self.black_since is not None and not self.blind
 
     @property
     def dim(self) -> Overlay:
@@ -639,7 +659,8 @@ class Engine(threading.Thread):
                 smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
             else:
                 try:
-                    stats = slot.sample(e.glare_weight > 0, self._settings.interval_ms / 1000.0)
+                    want_tiles = e.glare_weight > 0 or e.protected_opacity > 0
+                    stats = slot.sample(want_tiles, self._settings.interval_ms / 1000.0)
                     slot.capture_failures = 0
                 except OSError as err:  # e.g. secure desktop (UAC, lock screen): keep last state
                     self._capture_failed(slot, err)
@@ -654,12 +675,14 @@ class Engine(threading.Thread):
                     and smoother.settled
                     and slot.dim.excluded
                     and not slot.tint_moving(False)
+                    and not slot.blind_pending()
                 ):
                     continue  # fast path: no new frame, nothing moving, same profile -> no work
                 slot.computed_for = e
                 if stats is not None:
-                    slot.mean, slot.spot = stats
-                level = glare_level(slot.mean, slot.spot, e.glare_weight)
+                    slot.stats = stats
+                    slot.track_black(stats)
+                level = glare_level(slot.stats, e.glare_weight)
                 if not slot.dim.excluded:
                     # The alpha set one tick (>= 16 ms, several frames) ago is what the capture shows.
                     tint = slot.warm
@@ -669,6 +692,11 @@ class Engine(threading.Thread):
                     active = True
                 slot.level = level
                 slot.target = target_opacity(level, e.start, e.full, e.max_opacity)
+                if slot.blind and e.protected_opacity > 0:
+                    # The capture sees only black (DRM-protected video is blanked in every
+                    # screen capture): the picture cannot be measured, so the profile's fixed
+                    # protection applies instead of "no dimming".
+                    slot.target = max(slot.target, e.protected_opacity)
                 smoother.step(slot.target, dt)
             touched = True
             slot.dim.set_alpha(round(smoother.value))
@@ -826,7 +854,10 @@ class Engine(threading.Thread):
 
     def _publish_if_changed(self) -> None:
         """At display rate most rounds change nothing; the GUI needs at most ~10 updates/s."""
-        key = tuple((s.dim.alpha, round(s.tint_strength), round(s.mean), round(s.spot)) for s in self._slots.values())
+        key = tuple(
+            (s.dim.alpha, round(s.tint_strength), round(s.stats.mean), round(s.stats.spot), s.blind)
+            for s in self._slots.values()
+        )
         now = time.monotonic()
         if key != self._published_key or now - self._published_at >= STATUS_REFRESH_S:
             self._published_key, self._published_at = key, now
@@ -848,8 +879,9 @@ class Engine(threading.Thread):
                 tint=slot.tint_strength,
                 start=slot.effective.start if slot.effective.dim_on else None,
                 full=slot.effective.full if slot.effective.dim_on else None,
-                spot=slot.spot,
+                spot=slot.stats.spot,
                 capture=slot.backend,
+                protected=slot.blind,
             )
             for d, slot in sorted(self._slots.items(), key=lambda kv: index.get(kv[0], 99))
         ]

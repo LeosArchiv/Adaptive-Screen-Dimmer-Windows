@@ -25,4 +25,4 @@ def test_gpu_tiles_equal_cpu_tiles(gpu, shape) -> None:
     cpu_tiles = tile_sums(img)
     assert np.array_equal(gpu_tiles.astype(np.uint64), cpu_tiles)
     h, w = shape[:2]
-    assert frame_stats(gpu_tiles, w, h)[0] == pytest.approx(brightness(img), abs=1e-9)
+    assert frame_stats(gpu_tiles, w, h).mean == pytest.approx(brightness(img), abs=1e-9)

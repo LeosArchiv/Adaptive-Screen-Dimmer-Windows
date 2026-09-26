@@ -22,6 +22,7 @@ from .profiles import (
     KELVIN_MIN,
     OFF,
     OWN,
+    GLARE_LABELS,
     TINT_MAX,
     Profile,
     Rule,
@@ -332,7 +333,30 @@ class DimmerApp:
         ttk.Label(dim, text="Wieder aufhellen").grid(row=5, column=0, sticky="w", pady=2)
         r = self._combo(dim, self.p_release, list(RELEASE_PRESETS), 10, self._profile_changed)
         r.grid(row=5, column=1, sticky="w", padx=8)
-        self._dim_widgets += [a, r]
+        self.p_glare = tk.StringVar()
+        ttk.Label(dim, text="Helle Flecken").grid(row=6, column=0, sticky="w", pady=2)
+        g = self._combo(dim, self.p_glare, list(GLARE_LABELS), 10, self._profile_changed)
+        g.grid(row=6, column=1, sticky="w", padx=8)
+        self.p_protected = tk.IntVar()
+        prot = self._slider(
+            dim,
+            7,
+            "Geschütztes Video",
+            self.p_protected,
+            0,
+            60,
+            lambda v: "aus" if v == 0 else f"{v} %",
+            self._profile_changed,
+        )
+        self._dim_widgets += [a, r, g, prot]
+        ttk.Label(
+            dim,
+            text="Helle Flecken: dunkelt auch ab, wenn nur ein kleiner Bereich grell ist (z. B. Taschenlampe\n"
+            "im dunklen Film). Geschütztes Video (Netflix & Co. im Browser) ist für Bildschirmaufnahmen\n"
+            "schwarz – dort gilt dieser feste Wert, weil die Helligkeit nicht messbar ist.",
+            style="Muted.TLabel",
+            justify=tk.LEFT,
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         tint = ttk.Labelframe(right, text=" Blaulichtfilter ", style="Card.TLabelframe", padding=(10, 6))
         tint.pack(fill=tk.X, pady=(0, 8))
@@ -529,6 +553,8 @@ class DimmerApp:
             self.p_max.set(round(p.max_opacity / 255 * 100))
             self.p_attack.set(p.attack)
             self.p_release.set(p.release)
+            self.p_glare.set(GLARE_LABELS[p.glare])
+            self.p_protected.set(p.protected_dim)
             self.p_tint_mode.set(p.tint_mode)
             self.p_kelvin.set(p.tint_kelvin)
             self.p_strength.set(p.tint_strength)
@@ -576,6 +602,8 @@ class DimmerApp:
             max_opacity=max_opacity,
             attack=self.p_attack.get(),
             release=self.p_release.get(),
+            glare=GLARE_LABELS.index(self.p_glare.get()) if self.p_glare.get() in GLARE_LABELS else old.glare,
+            protected_dim=self.p_protected.get(),
             tint_mode=self.p_tint_mode.get(),
             tint_kelvin=self.p_kelvin.get(),
             tint_strength=self.p_strength.get(),
@@ -917,10 +945,12 @@ class DimmerApp:
                 _set_text(row.info, "nicht aktiv")
                 continue
             row.meter.show(m.brightness, m.start, m.full)
-            parts = [m.profile or "–"]
+            parts = [m.profile or "–", m.capture]
             if m.app:
                 parts.append(m.app)
             parts.append(f"{round(m.opacity / 255 * 100)} %")
+            if m.protected:
+                parts.append("Bild nicht messbar (geschützt?)")
             if m.tint >= 0.5:
                 parts.append(f"Filter {round(m.tint)} %")
             _set_text(row.info, "  ·  ".join(parts))

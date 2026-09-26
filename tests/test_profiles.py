@@ -139,3 +139,20 @@ def test_fade_is_clamped_to_the_shorter_phase() -> None:
     after = schedule_phase(s, 7 * H + 30)
     assert before == ("Tag", "Tag", 1.0) or before[2] > 0.99  # the morning fade has finished
     assert after[:2] == ("Tag", "Nacht") and after[2] == pytest.approx(0.0)
+
+
+def test_glare_and_protected_settings_follow_the_dimming_group() -> None:
+    p = profiles()
+    night = effective_of(p["Nacht"])
+    assert night.glare_weight > 0
+    off = resolve_monitor(p, {"x.exe": OFF_PROFILE}, Schedule(), AUTO, "x.exe", 23 * H)
+    assert off.glare_weight == 0 and off.protected_opacity == 0
+    movie = dataclasses_replace(p["Filme"], protected_dim=40)
+    e = effective_of(movie)
+    assert e.protected_opacity == pytest.approx(0.4 * 255)
+
+
+def dataclasses_replace(obj, **kw):  # small helper to keep imports local to this test
+    import dataclasses
+
+    return dataclasses.replace(obj, **kw)

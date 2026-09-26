@@ -42,11 +42,25 @@ def tile_sums(img: np.ndarray) -> np.ndarray:
     return tiles.sum(axis=2, dtype=np.uint64)
 
 
-def frame_stats(tiles: np.ndarray, width: int, height: int) -> tuple[float, float]:
-    """(mean brightness, brightest 128 px block) from exact tile sums, both 0..255.
+@dataclass(frozen=True)
+class FrameStats:
+    """What one captured frame tells the dimmer (brightness values 0..255)."""
 
-    The mean is the same metric as ``brightness``. The spot value finds a small very bright
-    area in an otherwise dark picture (a flashlight in a dark film scene) that the mean hides.
+    mean: float  # exact mean over all pixels (the classic metric)
+    spot: float  # brightest 128 x 128 px block anywhere on the screen
+    background: float  # median tile brightness: what the eyes are adapted to
+    black_share: float  # share of tiles that are exactly black (protected video shows as black)
+
+    @classmethod
+    def flat(cls, mean: float) -> FrameStats:
+        return cls(mean, mean, mean, 0.0)
+
+
+def frame_stats(tiles: np.ndarray, width: int, height: int) -> FrameStats:
+    """Statistics from exact tile sums.
+
+    The spot value finds a small very bright area in an otherwise dark picture (a flashlight
+    in a dark film scene) that the mean hides.
     """
     tiles = tiles.astype(np.uint64, copy=False)
     mean = float(tiles.sum(dtype=np.uint64)) / (width * height * 3)
@@ -54,6 +68,9 @@ def frame_stats(tiles: np.ndarray, width: int, height: int) -> tuple[float, floa
     rows = np.minimum(TILE, height - np.arange(gy) * TILE)
     cols = np.minimum(TILE, width - np.arange(gx) * TILE)
     counts = np.outer(rows, cols).astype(np.uint64)
+    tile_means = tiles / (counts * 3)
+    background = float(np.median(tile_means))
+    black_share = float(np.count_nonzero(tiles == 0)) / tiles.size
     b = min(SPOT_BLOCK, gy, gx)
     # Sliding block (step: one tile) via integral images, so a spot is found wherever it sits,
     # not only when it happens to align with a fixed grid.
@@ -61,10 +78,8 @@ def frame_stats(tiles: np.ndarray, width: int, height: int) -> tuple[float, floa
     block_counts = _window_sums(counts, b)
     # ignore slivers at the right/bottom edge: a few pixels must not count as a "block"
     full = block_counts >= (TILE * b) ** 2 // 2
-    if not full.any():
-        return mean, mean
-    spot = float((block_sums[full] / (block_counts[full] * 3)).max())
-    return mean, spot
+    spot = float((block_sums[full] / (block_counts[full] * 3)).max()) if full.any() else mean
+    return FrameStats(mean, max(spot, mean), background, black_share)
 
 
 def _window_sums(a: np.ndarray, b: int) -> np.ndarray:
@@ -74,9 +89,24 @@ def _window_sums(a: np.ndarray, b: int) -> np.ndarray:
     return ii[b:, b:] - ii[:-b, b:] - ii[b:, :-b] + ii[:-b, :-b]
 
 
-def glare_level(mean: float, spot: float, weight: float) -> float:
-    """Brightness the dimming reacts to: the mean, or a weighted bright spot if that is higher."""
-    return max(mean, spot * weight)
+GLARE_FLOOR = 6.0  # darkest adaptation level assumed (display black + some room light)
+GLARE_MIN_SPOT = 128.0  # spots darker than this never count as glare
+
+
+def glare_level(stats: FrameStats, weight: float) -> float:
+    """Brightness the dimming reacts to: the mean, raised when a small bright spot glares.
+
+    Discomfort glare grows with the spot's brightness relative to what the eyes are adapted
+    to (glare indices such as UGR use the ratio of source to background luminance). So the
+    same white spot counts fully in a dark film scene and hardly on a mid-grey page:
+    contrast 4:1 or less -> no glare, 32:1 or more -> full effect.
+    """
+    if weight <= 0 or stats.spot <= stats.mean:
+        return stats.mean
+    contrast = stats.spot / max(stats.background, GLARE_FLOOR)
+    strength = min(1.0, max(0.0, (math.log2(max(contrast, 1e-9)) - 2.0) / 3.0))
+    strength *= min(1.0, max(0.0, (stats.spot - GLARE_MIN_SPOT) / 64.0))
+    return stats.mean + weight * strength * (stats.spot - stats.mean)
 
 
 def compensate(observed: float, alpha: float, tint_alpha: float = 0.0, tint_level: float = 0.0) -> float:

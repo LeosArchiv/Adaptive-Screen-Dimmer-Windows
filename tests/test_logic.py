@@ -180,32 +180,58 @@ def test_compensate_with_tint_below_dimming(true_level: float) -> None:
 
 def test_frame_stats_mean_matches_brightness() -> None:
     img = np.random.default_rng(5).integers(0, 256, (1000, 1500, 4), dtype=np.uint8)
-    mean, spot = frame_stats(tile_sums(img), 1500, 1000)
-    assert mean == pytest.approx(brightness(img), abs=1e-9)
-    assert spot >= mean
+    st = frame_stats(tile_sums(img), 1500, 1000)
+    assert st.mean == pytest.approx(brightness(img), abs=1e-9)
+    assert st.spot >= st.mean
+
+
+def dark_scene(spot_value: int = 255, background: int = 12) -> np.ndarray:
+    img = np.full((1080, 1920, 4), background, np.uint8)  # dark film scene
+    img[100:260, 1600:1760, :3] = spot_value  # small flashlight spot (~1.2 % of the screen)
+    return img
 
 
 def test_spot_finds_flashlight_in_dark_scene() -> None:
-    img = np.full((1080, 1920, 4), 12, np.uint8)  # dark film scene
-    img[100:260, 1600:1760, :3] = 255  # small white flashlight spot (~1.2 % of the screen)
-    mean, spot = frame_stats(tile_sums(img), 1920, 1080)
-    assert mean < 20  # the mean hides it ...
-    assert spot > 240  # ... the spot value does not
-    assert glare_level(mean, spot, 0.5) > 100  # enough to trigger dimming
+    st = frame_stats(tile_sums(dark_scene()), 1920, 1080)
+    assert st.mean < 20  # the mean hides it ...
+    assert st.spot > 250  # ... the spot value does not, wherever it sits on the tile grid
+    assert st.background == pytest.approx(12, abs=0.5)
+    assert glare_level(st, 0.6) > 100  # enough to trigger dimming with profile "Filme"
+    assert glare_level(st, 0.0) == st.mean  # glare protection off: classic behaviour
+
+
+def test_same_spot_on_mid_grey_hardly_counts() -> None:
+    st = frame_stats(tile_sums(dark_scene(background=110)), 1920, 1080)
+    assert glare_level(st, 0.6) < st.mean + 10  # contrast only ~2:1, no discomfort glare
+
+
+def test_dim_spot_is_not_glare() -> None:
+    st = frame_stats(tile_sums(dark_scene(spot_value=110)), 1920, 1080)
+    assert glare_level(st, 0.9) == pytest.approx(st.mean)
 
 
 def test_small_bright_text_is_not_a_spot() -> None:
     img = np.full((1080, 1920, 4), 30, np.uint8)  # dark IDE
     img[200:1000:20, 100:900, :3] = 220  # 1 px bright text lines every 20 px
-    mean, spot = frame_stats(tile_sums(img), 1920, 1080)
-    assert spot < 60
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    assert st.spot < 60
+    assert glare_level(st, 0.9) < st.mean + 5
+
+
+def test_black_share_detects_blanked_video() -> None:
+    img = np.zeros((1080, 1920, 4), np.uint8)
+    img[:40, :, :3] = 60  # a browser toolbar is still visible
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    assert st.black_share > 0.9
+    dark = frame_stats(tile_sums(np.full((1080, 1920, 4), 3, np.uint8)), 1920, 1080)
+    assert dark.black_share == 0.0  # a very dark but real picture is not "blanked"
 
 
 def test_edge_slivers_do_not_count_as_blocks() -> None:
     img = np.zeros((1080, 1924, 4), np.uint8)
     img[:, 1920:, :3] = 255  # 4 px bright column at the right edge
-    _mean, spot = frame_stats(tile_sums(img), 1924, 1080)
-    assert spot < 10
+    st = frame_stats(tile_sums(img), 1924, 1080)
+    assert st.spot < 10
 
 
 def test_hold_phase_is_not_settled() -> None:
