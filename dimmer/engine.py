@@ -18,6 +18,8 @@ from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from . import overlay as overlay_mod
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS, Smoother, brightness, compensate, target_opacity
 from .overlay import Overlay
@@ -88,6 +90,7 @@ KELVIN_RATE = 3000.0  # kelvin per second
 MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
 PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
+FINGERPRINT_STEP = 8
 APP_CONFIRM = 2  # consecutive sightings before a monitor switches to another app's profile
 IDLE_AFTER_S = 2.0  # screen unchanged this long -> slower measuring
 IDLE_FACTOR = 2.0  # at most 100 ms extra latency for a flash after a still phase
@@ -149,6 +152,8 @@ class _Slot:
         self.level = 0.0
         self.target = 0.0
         self.capture_failures = 0
+        self._fingerprint: np.ndarray | None = None
+        self._fingerprint_level = 0.0
         self.effective = Effective()
         self.app: str | None = None
         self.app_known = False
@@ -156,6 +161,24 @@ class _Slot:
         self.pending_hits = 0
         self.tint_strength = 0.0  # current, fades toward effective.tint_strength
         self.tint_kelvin = 3400.0
+
+    def measure(self, pixels: np.ndarray) -> float:
+        """Exact mean brightness, skipped when the frame is unchanged.
+
+        A fixed coarse grid (every 8th pixel) is compared with the previous frame first; the
+        exact sum over all pixels (the most expensive step) only runs when something changed.
+        A change missing every grid point is smaller than 8x8 pixels and moves the mean by
+        less than 0.01, far below anything visible.
+        """
+        fingerprint = pixels[::FINGERPRINT_STEP, ::FINGERPRINT_STEP, :3]
+        if self._fingerprint is not None and np.array_equal(fingerprint, self._fingerprint):
+            return self._fingerprint_level
+        self._fingerprint = fingerprint.copy()
+        self._fingerprint_level = brightness(pixels)
+        return self._fingerprint_level
+
+    def forget_frame(self) -> None:
+        self._fingerprint = None
 
     @property
     def dim(self) -> Overlay:
@@ -176,6 +199,7 @@ class _Slot:
             self.sampler.close()
             self.sampler = sampler
             self.monitor = monitor
+            self.forget_frame()
 
     def renew_sampler(self) -> None:
         sampler = Sampler()
@@ -457,7 +481,7 @@ class Engine(threading.Thread):
             else:
                 try:
                     m = slot.monitor
-                    level = brightness(slot.sampler.grab(m.left, m.top, m.width, m.height))
+                    level = slot.measure(slot.sampler.grab(m.left, m.top, m.width, m.height))
                     slot.capture_failures = 0
                 except OSError as err:  # e.g. secure desktop (UAC, lock screen): keep last state
                     self._capture_failed(slot, err)

@@ -47,7 +47,8 @@ FONT = ("Segoe UI", 10)
 FONT_SMALL = ("Segoe UI", 9)
 FONT_TITLE = ("Segoe UI Semibold", 13)
 LOG_LINES = 300
-POLL_MS = 100
+POLL_MS = 200  # 5 updates per second are plenty for meters and labels
+POLL_HIDDEN_MS = 1000  # window hidden: only tray actions and tooltip
 SAVE_DELAY_MS = 600
 STALL_S = 3.0
 # Measurements per second while something moves; still screens are measured at half the rate.
@@ -59,6 +60,14 @@ MODE_LABELS = {OWN: "eigene Werte", INHERIT: "vom Grundprofil übernehmen", OFF:
 
 def rate_name(interval_ms: int) -> str:
     return min(RATE_PRESETS, key=lambda name: abs(RATE_PRESETS[name] - interval_ms))
+
+
+def _set_text(widget: tk.Misc, text: str, **options: str) -> None:
+    """Configure a widget only when something changed (Tk redraws on every config call)."""
+    current = {"text": str(widget.cget("text")), **{k: str(widget.cget(k)) for k in options}}
+    wanted = {"text": text, **options}
+    if current != wanted:
+        widget.configure(**wanted)
 
 
 class QueueLogHandler(logging.Handler):
@@ -88,9 +97,19 @@ class Meter(tk.Canvas):
         self.start = self.create_line(0, 0, 0, self.H, fill=ACCENT, width=2)
         self.full = self.create_line(0, 0, 0, self.H, fill=ERR, width=2)
 
+    _last: tuple[int, int, int] | None = None
+
     def show(self, level: float, start: float | None, full: float | None) -> None:
         def x(v: float) -> float:
             return max(0.0, min(1.0, v / 255.0)) * self.W
+
+        def px(v: float | None) -> int:
+            return -5 if v is None else round(x(v))
+
+        state = (px(level), px(start), px(full))
+        if state == self._last:  # redraw only when a pixel actually moves
+            return
+        self._last = state
 
         self.coords(self.bar, 0, 0, x(level), self.H)
         for item, value in ((self.start, start), (self.full, full)):
@@ -872,13 +891,15 @@ class DimmerApp:
 
     # ---- polling -------------------------------------------------------------------------------
     def _poll(self) -> None:
+        hidden = self.root.state() in ("withdrawn", "iconic")
         try:
             st = self.engine.snapshot()
-            self._refresh(st)
-            self._drain_log()
+            if not hidden:  # nothing to draw while the window is not shown
+                self._refresh(st)
+                self._drain_log()
             self._handle_tray(st)
         finally:
-            self.root.after(POLL_MS, self._poll)
+            self.root.after(POLL_HIDDEN_MS if hidden else POLL_MS, self._poll)
 
     def _refresh(self, st: Status) -> None:
         monitors = self.engine.monitors()
@@ -893,7 +914,7 @@ class DimmerApp:
             m = rows.get(device)
             if m is None:
                 row.meter.show(0.0, None, None)
-                row.info.config(text="nicht aktiv")
+                _set_text(row.info, "nicht aktiv")
                 continue
             row.meter.show(m.brightness, m.start, m.full)
             parts = [m.profile or "–"]
@@ -902,7 +923,7 @@ class DimmerApp:
             parts.append(f"{round(m.opacity / 255 * 100)} %")
             if m.tint >= 0.5:
                 parts.append(f"Filter {round(m.tint)} %")
-            row.info.config(text="  ·  ".join(parts))
+            _set_text(row.info, "  ·  ".join(parts))
 
         stalled = st.running and st.heartbeat and time.monotonic() - st.heartbeat > STALL_S
         if st.error:
@@ -915,9 +936,9 @@ class DimmerApp:
             text, color = "Pausiert", WARN
         else:
             text, color = "Aktiv", OK
-        self.state_label.config(text=f"● {text}", fg=color)
-        self.pause_btn.config(text="▶  Fortsetzen" if st.paused_reason == "user" else "⏸  Pausieren")
-        self.hotkey_hint.config(text="Strg+Alt+D" if st.hotkey_ok else "")
+        _set_text(self.state_label, f"● {text}", fg=color)
+        _set_text(self.pause_btn, "▶  Fortsetzen" if st.paused_reason == "user" else "⏸  Pausieren")
+        _set_text(self.hotkey_hint, "Strg+Alt+D" if st.hotkey_ok else "")
 
         if st.recent_apps != self._recent_apps:
             self._recent_apps = list(st.recent_apps)
@@ -927,12 +948,12 @@ class DimmerApp:
     def _refresh_schedule_hint(self) -> None:
         sch = self.settings.schedule
         if not sch.enabled:
-            self.s_now.config(text="Zeitplan aus: „Automatisch“ nutzt das Tag-Profil.")
+            _set_text(self.s_now, "Zeitplan aus: „Automatisch“ nutzt das Tag-Profil.")
             return
         lt = time.localtime()
         a, b, t = schedule_phase(sch, lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60)
         if a == b:
             nxt = sch.night_start if a == sch.day_profile else sch.day_start
-            self.s_now.config(text=f"Jetzt: {a}  ·  nächster Wechsel um {nxt}")
+            _set_text(self.s_now, f"Jetzt: {a}  ·  nächster Wechsel um {nxt}")
         else:
-            self.s_now.config(text=f"Jetzt: Übergang {a} → {b} ({round(t * 100)} %)")
+            _set_text(self.s_now, f"Jetzt: Übergang {a} → {b} ({round(t * 100)} %)")

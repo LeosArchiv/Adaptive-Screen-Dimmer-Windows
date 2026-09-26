@@ -73,6 +73,7 @@ def main() -> None:
     calm_mark: list[float] = []
     t0 = time.perf_counter()
     cpu_start = _thread_cpu(proc, engine.native_id)
+    proc_start = proc.cpu_times()
 
     def tick() -> None:
         t = time.perf_counter() - t0
@@ -99,6 +100,8 @@ def main() -> None:
 
     def finish(t: float) -> None:
         eng_cpu = (_thread_cpu(proc, engine.native_id) - cpu_start) / t * 100
+        pc = proc.cpu_times()
+        proc_cpu = (pc.user + pc.system - proc_start.user - proc_start.system) / t * 100
         lat: list[float] = []
         full: list[float] = []
         off: list[float] = []
@@ -118,6 +121,7 @@ def main() -> None:
             "brighten_to_zero_ms": [round(x * 1000) for x in off],
             "steady_values_while_white": sorted(steady),
             "cpu_engine_overall": round(eng_cpu, 1),
+            "cpu_process_overall": round(proc_cpu, 1),  # includes the Tk test window
             "cpu_engine_calm": round(statistics.mean(calm_cpu), 1) if calm_cpu else None,
             "rss_mb": round(proc.memory_info().rss / 2**20, 1),
         }
