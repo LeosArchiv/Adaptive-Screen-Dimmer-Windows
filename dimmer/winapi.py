@@ -240,32 +240,38 @@ def _window_pid(hwnd: int) -> int:
     return int(pid.value)
 
 
+_exe_cache: dict[int, str | None] = {}
+
+
 def _exe_name(pid: int) -> str | None:
+    if pid in _exe_cache:
+        return _exe_cache[pid]
+    exe = None
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return None
-    try:
-        size = wintypes.DWORD(1024)
-        buf = ctypes.create_unicode_buffer(size.value)
-        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-            return None
-        return os.path.basename(buf.value).lower()
-    finally:
-        kernel32.CloseHandle(handle)
+    if handle:
+        try:
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                exe = os.path.basename(buf.value).lower()
+        finally:
+            kernel32.CloseHandle(handle)
+    if len(_exe_cache) > 512:  # pids are reused; keep the cache small and fresh
+        _exe_cache.clear()
+    if exe:
+        _exe_cache[pid] = exe
+    return exe
 
 
 UWP_HOST = "applicationframehost.exe"
 
 
-def foreground_exe() -> str | None:
-    """Lower-case exe name of the foreground window's process, None if unknown or our own.
+def window_exe(hwnd: int) -> str | None:
+    """Lower-case exe name owning a top-level window, None if unknown or our own.
 
     Store apps are hosted by ApplicationFrameHost; for those the app's own process (owner of
-    the hosted child window) is returned, so an exception never covers all Store apps at once.
+    the hosted child window) is returned, so a rule never covers all Store apps at once.
     """
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return None
     pid = _window_pid(hwnd)
     if not pid or pid == os.getpid():
         return None
@@ -286,3 +292,77 @@ def foreground_exe() -> str | None:
             if child_pid and child_pid != pid:
                 return _exe_name(child_pid) or exe
     return exe
+
+
+def foreground_exe() -> str | None:
+    hwnd = user32.GetForegroundWindow()
+    return window_exe(hwnd) if hwnd else None
+
+
+DWMWA_CLOAKED = 14
+_dwmapi = ctypes.WinDLL("dwmapi")
+_dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+# Apps must cover at least this share of a monitor to count as "open on" it (skips popups,
+# notifications and small tool windows).
+MIN_COVERAGE = 0.25
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    cloaked = wintypes.DWORD()
+    ok = _dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+    return ok == 0 and bool(cloaked.value)
+
+
+def top_windows() -> list[int]:
+    """Top-level windows in z-order, topmost first."""
+    result: list[int] = []
+
+    @EnumWindowsProc
+    def collect(hwnd: int, _lp: int) -> bool:
+        result.append(hwnd)
+        return True
+
+    user32.EnumWindows(collect, 0)
+    return result
+
+
+def apps_per_monitor(monitors: list[Monitor]) -> dict[str, str | None]:
+    """For each monitor the exe of the topmost real app window on it (None: only desktop)."""
+    found: dict[str, str | None] = {}
+    rect = wintypes.RECT()
+    for hwnd in top_windows():
+        if len(found) == len(monitors):
+            break
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            continue
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) or _is_cloaked(hwnd):
+            continue
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            continue
+        best: Monitor | None = None
+        best_share = 0.0
+        for m in monitors:
+            w = min(rect.right, m.left + m.width) - max(rect.left, m.left)
+            h = min(rect.bottom, m.top + m.height) - max(rect.top, m.top)
+            if w <= 0 or h <= 0:
+                continue
+            share = w * h / float(m.width * m.height)
+            if share > best_share:
+                best, best_share = m, share
+        if best is None or best.device in found or best_share < MIN_COVERAGE:
+            continue
+        exe = window_exe(hwnd)
+        if exe is None and _window_pid(hwnd) == os.getpid():
+            continue  # our own window: look at what is underneath
+        found[best.device] = exe
+    return found

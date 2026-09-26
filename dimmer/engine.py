@@ -13,6 +13,7 @@ import math
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -20,8 +21,9 @@ from dataclasses import dataclass, field
 from . import overlay as overlay_mod
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS, Smoother, brightness, compensate, target_opacity
 from .overlay import Overlay
+from .profiles import Effective, kelvin_to_rgb, resolve_monitor
 from .settings import Settings
-from .winapi import Monitor, Sampler, clear_monitor_id_cache, foreground_exe, list_monitors, user32
+from .winapi import Monitor, Sampler, apps_per_monitor, clear_monitor_id_cache, list_monitors, user32
 
 log = logging.getLogger("dimmer")
 
@@ -81,9 +83,11 @@ user32.MsgWaitForMultipleObjects.argtypes = [
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 QS_ALLINPUT = 0x04FF
 
+TINT_RATE = 25.0  # percent per second: profile changes blend the tint in ~1 s
+KELVIN_RATE = 3000.0  # kelvin per second
 MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
-FOREGROUND_CHECK_S = 0.25
+PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
 IDLE_AFTER_S = 2.0  # screen unchanged this long -> slower measuring
 IDLE_FACTOR = 2.0  # at most 100 ms extra latency for a flash after a still phase
 IDLE_INTERVAL_MAX_S = 0.25  # while paused
@@ -102,14 +106,18 @@ class MonitorStatus:
     target: float = 0.0
     opacity: int = 0
     excluded_from_capture: bool = True
+    profile: str = ""  # e.g. "Zocken + Nacht"
+    reason: str = ""  # e.g. "Programm ddnet.exe", "Zeitplan"
+    app: str | None = None  # app in front on this monitor
+    tint: float = 0.0  # current blue-light filter strength in percent
 
 
 @dataclass
 class Status:
     running: bool = False
     paused: bool = False
-    paused_reason: str = ""  # "", "user", "app:<exe>"
-    last_foreign_app: str | None = None
+    paused_reason: str = ""  # "" or "user"
+    recent_apps: list[str] = field(default_factory=list)  # newest first, for rule suggestions
     monitors: list[MonitorStatus] = field(default_factory=list)
     error: str | None = None
     hotkey_ok: bool = False
@@ -125,21 +133,39 @@ class _Slot:
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
         self.sampler = Sampler()
+        self.overlay: Overlay | None = None
+        self.tint: Overlay | None = None
         try:
-            self.overlay = Overlay(monitor)
+            self.tint = Overlay(monitor, kelvin_to_rgb(3400))
+            self.overlay = Overlay(monitor)  # created last = above the tint
         except Exception:
-            self.sampler.close()
+            self.close()
             raise
         self.smoother = Smoother()
         self.level = 0.0
         self.target = 0.0
         self.capture_failures = 0
+        self.effective = Effective()
+        self.app: str | None = None
+        self.tint_strength = 0.0  # current, fades toward effective.tint_strength
+        self.tint_kelvin = 3400.0
+
+    @property
+    def dim(self) -> Overlay:
+        assert self.overlay is not None
+        return self.overlay
+
+    @property
+    def warm(self) -> Overlay:
+        assert self.tint is not None
+        return self.tint
 
     def update_geometry(self, monitor: Monitor, index: int) -> None:
         self.index = index
         if monitor != self.monitor:
             sampler = Sampler()  # swap only once the new one exists
-            self.overlay.move(monitor)
+            self.warm.move(monitor)
+            self.dim.move(monitor)
             self.sampler.close()
             self.sampler = sampler
             self.monitor = monitor
@@ -149,9 +175,45 @@ class _Slot:
         self.sampler.close()
         self.sampler = sampler
 
+    def tint_moving(self) -> bool:
+        e = self.effective
+        return abs(self.tint_strength - e.tint_strength) > 0.05 or (
+            e.tint_on and abs(self.tint_kelvin - e.tint_kelvin) > 1
+        )
+
+    def step_tint(self, dt: float, off: bool) -> None:
+        """Move the blue-light filter linearly toward its target; slow enough to never flicker."""
+        goal = 0.0 if off else self.effective.tint_strength
+        self.tint_strength = _approach(self.tint_strength, goal, TINT_RATE * dt)
+        if self.effective.tint_on:
+            self.tint_kelvin = _approach(self.tint_kelvin, self.effective.tint_kelvin, KELVIN_RATE * dt)
+        self.warm.set_color(kelvin_to_rgb(self.tint_kelvin))
+        self.warm.set_alpha(round(self.tint_strength / 100 * 255))
+
+    def keep_on_top(self) -> None:
+        self.warm.keep_on_top()
+        self.dim.keep_on_top()  # dimming stays above the tint
+
+    def clear(self) -> None:
+        self.smoother.reset(0.0)
+        self.tint_strength = 0.0
+        if self.overlay:
+            self.overlay.set_alpha(0)
+        if self.tint:
+            self.tint.set_alpha(0)
+
     def close(self) -> None:
-        self.overlay.destroy()
+        if self.overlay:
+            self.overlay.destroy()
+        if self.tint:
+            self.tint.destroy()
         self.sampler.close()
+
+
+def _approach(value: float, goal: float, step: float) -> float:
+    if abs(goal - value) <= step:
+        return goal
+    return value + step if goal > value else value - step
 
 
 def wanted_devices(chosen: list[str], monitors: list[Monitor]) -> list[str]:
@@ -182,7 +244,7 @@ class Engine(threading.Thread):
         self._slots: dict[str, _Slot] = {}
         self._monitors: list[Monitor] = []
         self._paused = settings.start_paused
-        self._app_paused: str | None = None
+        self._recent_apps: deque[str] = deque(maxlen=12)
         self._wake_now = False
         self._monitors_dirty = True  # first loop round enumerates the monitors
         self._force_refresh = False
@@ -217,7 +279,7 @@ class Engine(threading.Thread):
                 running=s.running,
                 paused=s.paused,
                 paused_reason=s.paused_reason,
-                last_foreign_app=s.last_foreign_app,
+                recent_apps=list(s.recent_apps),
                 monitors=[MonitorStatus(**vars(m)) for m in s.monitors],
                 error=s.error,
                 hotkey_ok=s.hotkey_ok,
@@ -285,8 +347,8 @@ class Engine(threading.Thread):
                     self._refresh_monitors(force=self._force_refresh)
                     self._force_refresh = False
                 if now >= next_fg:
-                    self._check_foreground()
-                    next_fg = now + FOREGROUND_CHECK_S
+                    self._resolve_profiles()
+                    next_fg = now + PROFILE_CHECK_S
 
                 if now >= next_tick:
                     # Cap dt at two active intervals: after a slow idle phase the ramp must still
@@ -300,7 +362,7 @@ class Engine(threading.Thread):
 
                 if now >= next_topmost:
                     for slot in self._slots.values():
-                        slot.overlay.keep_on_top()
+                        slot.keep_on_top()
                     next_topmost = now + TOPMOST_REFRESH_S
                 if failures:
                     log.info("Messschleife läuft wieder")
@@ -328,8 +390,7 @@ class Engine(threading.Thread):
     def _clear_overlays(self) -> None:
         for slot in self._slots.values():
             try:
-                slot.smoother.reset(0.0)
-                slot.overlay.set_alpha(0)
+                slot.clear()
             except Exception:
                 log.debug("could not clear overlay", exc_info=True)
 
@@ -353,51 +414,55 @@ class Engine(threading.Thread):
                 log.debug("pump failed during backoff", exc_info=True)
 
     def _any_moving(self) -> bool:
-        return any(not slot.smoother.settled for slot in self._slots.values())
+        return any(not slot.smoother.settled or slot.tint_moving() for slot in self._slots.values())
 
     def _current_interval(self, calm_for: float) -> float:
         """Full rate while anything moves; a slower rate once every monitor has been still."""
         base = self._settings.interval_ms / 1000.0
         if self._any_moving():
             return base  # a running fade always gets full rate, or it would show as steps
-        if self._paused or self._app_paused is not None:
-            return max(base, IDLE_INTERVAL_MAX_S)
+        if self._paused or not any(slot.effective.dim_on for slot in self._slots.values()):
+            return max(base, IDLE_INTERVAL_MAX_S)  # nothing to measure
         if calm_for >= IDLE_AFTER_S:
             return min(max(base, base * IDLE_FACTOR), max(base, IDLE_INTERVAL_MAX_S))
         return base
 
     def _tick(self, dt: float) -> bool:
         """One measurement/update round. Returns True when something changed noticeably."""
-        s = self._settings
         active = False
         for slot in self._slots.values():
+            e = slot.effective
+            smoother = slot.smoother
             if self._paused:
                 slot.target = 0.0
-                slot.smoother.reset(0.0)  # user asked for it: off at once
-            elif self._app_paused is not None:
+                smoother.reset(0.0)  # user asked for it: off at once
+                slot.tint_strength = 0.0
+            elif not e.dim_on:
                 slot.target = 0.0
-                slot.smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
+                smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
             else:
                 try:
                     m = slot.monitor
                     level = brightness(slot.sampler.grab(m.left, m.top, m.width, m.height))
                     slot.capture_failures = 0
-                except OSError as e:  # e.g. secure desktop (UAC, lock screen): keep last state
-                    self._capture_failed(slot, e)
+                except OSError as err:  # e.g. secure desktop (UAC, lock screen): keep last state
+                    self._capture_failed(slot, err)
                     if slot.capture_failures >= CAPTURE_RENEW_AFTER:
-                        slot.smoother.step(0.0, dt)
-                        slot.overlay.set_alpha(round(slot.smoother.value))
+                        smoother.step(0.0, dt)
+                        slot.dim.set_alpha(round(smoother.value))
+                    slot.step_tint(dt, off=False)
                     continue
-                if not slot.overlay.excluded:
+                if not slot.dim.excluded:
                     # The alpha set one tick (>= 16 ms, several frames) ago is what the capture shows.
-                    level = compensate(level, slot.overlay.alpha)
+                    level = compensate(level, slot.dim.alpha)
                 if abs(level - slot.level) > CALM_THRESHOLD:
                     active = True
                 slot.level = level
-                slot.target = target_opacity(level, s.start, s.full, s.max_opacity)
-                slot.smoother.step(slot.target, dt)
-            slot.overlay.set_alpha(round(slot.smoother.value))
-            if not slot.smoother.settled:
+                slot.target = target_opacity(level, e.start, e.full, e.max_opacity)
+                smoother.step(slot.target, dt)
+            slot.dim.set_alpha(round(smoother.value))
+            slot.step_tint(dt, off=self._paused)
+            if not smoother.settled or slot.tint_moving():
                 active = True
         self._publish()
         return active
@@ -448,20 +513,13 @@ class Engine(threading.Thread):
     def _apply_settings(self, s: Settings) -> None:
         old = self._settings
         self._settings = s
-        for slot in self._slots.values():
-            self._configure_smoother(slot.smoother)
         if s.hotkey != old.hotkey:
             self._unregister_hotkey()
             self._register_hotkey()
         if s.monitors != old.monitors:
             self._force_refresh = True  # done by the loop, which retries if it fails
-        if s.excluded_apps != old.excluded_apps:
-            self._check_foreground()
+        self._resolve_profiles()  # profile edits apply at once
         self._wake_now = True
-
-    def _configure_smoother(self, smoother: Smoother) -> None:
-        smoother.attack = ATTACK_PRESETS[self._settings.attack]
-        smoother.release = RELEASE_PRESETS[self._settings.release]
 
     def _set_paused(self, paused: bool) -> None:
         if paused != self._paused:
@@ -470,20 +528,28 @@ class Engine(threading.Thread):
         self._wake_now = True
         self._publish()
 
-    def _check_foreground(self) -> None:
-        exe = foreground_exe()
-        if exe:
-            with self._lock:
-                self._status.last_foreign_app = exe
-        excluded = exe if exe and exe in self._settings.excluded_apps else None
-        # Our own window in front keeps the previous decision (exe is None then).
-        if exe is None:
-            return
-        if excluded != self._app_paused:
-            self._app_paused = excluded
-            if excluded:
-                log.info("Ausnahme aktiv: %s", excluded)
-            self._wake_now = True
+    def _resolve_profiles(self) -> None:
+        """Decide per monitor which profile applies: base (fixed or day/night) + app in front."""
+        s = self._settings
+        profiles, rules = s.profile_map(), s.rule_map()
+        apps = apps_per_monitor([slot.monitor for slot in self._slots.values()]) if self._slots else {}
+        lt = time.localtime()
+        minute = lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60
+        for device, slot in self._slots.items():
+            app = apps.get(device)
+            if app and (not self._recent_apps or self._recent_apps[0] != app):
+                if app in self._recent_apps:
+                    self._recent_apps.remove(app)
+                self._recent_apps.appendleft(app)
+            effective = resolve_monitor(profiles, rules, s.schedule, s.base_choice(device), app, minute)
+            if effective.label != slot.effective.label:
+                log.info("%s: Profil %s (%s)", slot.monitor.gdi_name, effective.label, effective.reason)
+            if effective != slot.effective:
+                slot.effective = effective
+                slot.smoother.attack = ATTACK_PRESETS[effective.attack]
+                slot.smoother.release = RELEASE_PRESETS[effective.release]
+                self._wake_now = True
+            slot.app = app
 
     def _refresh_monitors(self, force: bool = False) -> None:
         monitors = list_monitors()
@@ -504,9 +570,9 @@ class Engine(threading.Thread):
                 slot.update_geometry(monitor, index)
                 continue
             slot = _Slot(monitor, index)
-            self._configure_smoother(slot.smoother)
             self._slots[device] = slot
-            if not slot.overlay.excluded:
+            self._resolve_profiles()
+            if not slot.dim.excluded:
                 log.warning("Overlay kann nicht aus der Messung ausgenommen werden \u2013 Kompensation aktiv")
         with self._lock:
             self._monitors = monitors
@@ -514,22 +580,26 @@ class Engine(threading.Thread):
 
     def _publish(self) -> None:
         index = {m.device: i for i, m in enumerate(self._monitors)}
-        reason = "user" if self._paused else (f"app:{self._app_paused}" if self._app_paused else "")
         rows = [
             MonitorStatus(
                 device=d,
                 label=monitor_label(slot.monitor, index.get(d, slot.index)),
                 brightness=slot.level,
                 target=slot.target,
-                opacity=slot.overlay.alpha,
-                excluded_from_capture=slot.overlay.excluded,
+                opacity=slot.dim.alpha,
+                excluded_from_capture=slot.dim.excluded,
+                profile=slot.effective.label,
+                reason=slot.effective.reason,
+                app=slot.app,
+                tint=slot.tint_strength,
             )
             for d, slot in sorted(self._slots.items(), key=lambda kv: index.get(kv[0], 99))
         ]
         with self._lock:
-            self._status.paused = bool(reason)
-            self._status.paused_reason = reason
+            self._status.paused = self._paused
+            self._status.paused_reason = "user" if self._paused else ""
             self._status.monitors = rows
+            self._status.recent_apps = list(self._recent_apps)
             self._status.heartbeat = time.monotonic()
 
     # ---- Win32 plumbing ----------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Uses a throw-away config directory and quits after a few seconds (kill switch included).
 
-    python tools/gui_snapshot.py out.png [--log] [--paused]
+    python tools/gui_snapshot.py out.png [--tab N] [--paused]
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("out", type=Path)
-    ap.add_argument("--log", action="store_true", help="expand the log panel")
     ap.add_argument("--paused", action="store_true")
     ap.add_argument("--delay", type=float, default=3.0)
+    ap.add_argument("--tab", type=int, default=0, help="notebook tab to show")
     args = ap.parse_args()
     threading.Timer(args.delay + 8, lambda: os._exit(3)).start()  # kill switch
     os.environ["ASD_CONFIG_DIR"] = tempfile.mkdtemp(prefix="asd-snap-")
@@ -37,14 +37,12 @@ def main() -> None:
     handler = app._setup_logging(False)
     s = settings_mod.load()
     s.start_paused = args.paused
-    s.excluded_apps = ["photoshop.exe"]
     engine = Engine(s)
     engine.start()
     root = tk.Tk()
     root.attributes("-topmost", True)
     ui = DimmerApp(root, engine, s, handler)  # type: ignore[arg-type]
-    if args.log:
-        ui._toggle_log()
+    ui.notebook.select(args.tab)
 
     def shoot() -> None:
         root.update()

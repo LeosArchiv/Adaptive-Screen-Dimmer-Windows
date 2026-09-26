@@ -7,8 +7,15 @@ import time
 import pytest
 
 from dimmer.engine import Engine
+from dimmer.profiles import Profile, Rule
 from dimmer.settings import Settings
 from dimmer.winapi import enable_dpi_awareness
+
+
+def quiet(**kw) -> Settings:
+    """Real overlays that never visibly dim or tint (one profile, strongest dimming 0)."""
+    return Settings(profiles=[Profile("Test", max_opacity=0)], rules=[], hotkey=False, **kw)
+
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASD_LIVE_TESTS") != "1", reason="set ASD_LIVE_TESTS=1")
 
@@ -16,7 +23,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("ASD_LIVE_TESTS") != "1", reason=
 @pytest.fixture
 def engine():
     enable_dpi_awareness()
-    e = Engine(Settings(max_opacity=0, hotkey=False))
+    e = Engine(quiet())
     e.start()
     assert e.wait_ready(5)
     yield e
@@ -46,10 +53,10 @@ def test_start_measure_pause_stop(engine: Engine) -> None:
 def test_switch_monitors_at_runtime(engine: Engine) -> None:
     monitors = engine.monitors()
     all_ids = [m.device for m in monitors]
-    engine.update_settings(Settings(max_opacity=0, hotkey=False, monitors=all_ids))
+    engine.update_settings(quiet(monitors=all_ids))
     time.sleep(0.4)
     assert {m.device for m in engine.snapshot().monitors} == set(all_ids)
-    engine.update_settings(Settings(max_opacity=0, hotkey=False, monitors=all_ids[-1:]))
+    engine.update_settings(quiet(monitors=all_ids[-1:]))
     time.sleep(0.4)
     assert [m.device for m in engine.snapshot().monitors] == all_ids[-1:]
 
@@ -94,3 +101,32 @@ def test_persistent_errors_keep_engine_controllable(engine: Engine, monkeypatch:
     engine.set_paused(True)
     time.sleep(2.5)  # longest backoff is 2 s
     assert engine.snapshot().paused_reason == "user"
+
+
+def test_status_reports_profile_and_app(engine: Engine) -> None:
+    time.sleep(0.6)
+    m = engine.snapshot().monitors[0]
+    assert m.profile == "Test"
+    assert m.tint == 0.0
+
+
+def test_app_rule_switches_profile_only_on_that_monitor(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    import dimmer.engine as engine_mod
+
+    monitors = engine.monitors()
+    ids = [m.device for m in monitors]
+    fake_app = {ids[0]: "game.exe"}
+    monkeypatch.setattr(engine_mod, "apps_per_monitor", lambda mons: {m.device: fake_app.get(m.device) for m in mons})
+    engine.update_settings(
+        Settings(
+            profiles=[Profile("Test", max_opacity=0), Profile("Spiel", max_opacity=0, attack="Sofort")],
+            rules=[Rule("game.exe", "Spiel")],
+            monitors=ids,
+            hotkey=False,
+        )
+    )
+    time.sleep(0.8)
+    rows = {m.device: m for m in engine.snapshot().monitors}
+    assert rows[ids[0]].profile == "Spiel" and rows[ids[0]].app == "game.exe"
+    for other in ids[1:]:
+        assert rows[other].profile == "Test"

@@ -59,7 +59,11 @@ def main() -> None:
     root.configure(bg="black")
     root.attributes("-topmost", True)
 
-    engine = Engine(Settings(monitors=[mon.device], interval_ms=args.interval, hotkey=False))
+    # fixed "Tag" profile: the result must not depend on the time of day
+    settings = Settings(
+        monitors=[mon.device], monitor_profiles={mon.device: "Tag"}, rules=[], interval_ms=args.interval, hotkey=False
+    )
+    engine = Engine(settings)
     engine.start()
     engine.wait_ready()
     proc = psutil.Process()

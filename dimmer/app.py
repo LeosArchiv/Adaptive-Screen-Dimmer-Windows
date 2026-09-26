@@ -79,12 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     settings = settings_mod.load()
     # --paused applies to this run only and must not end up in the saved settings
     engine_settings = dataclasses.replace(settings, start_paused=True) if args.paused else settings
-    log.info(
-        "Start – Abdunkeln ab %d, volle Stärke ab %d, max. %d %%",
-        settings.start,
-        settings.full,
-        round(settings.max_opacity / 255 * 100),
-    )
+    log.info("Start – %d Profile, %d Programmregeln", len(settings.profiles), len(settings.rules))
 
     engine = Engine(engine_settings)
     engine.start()

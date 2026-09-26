@@ -1,4 +1,5 @@
-"""Click-through, top-most black overlay window for one monitor.
+"""Click-through, top-most overlay window for one monitor: black for dimming, warm for the
+blue-light filter.
 
 All methods must be called from the thread that created the overlay (Win32 window affinity).
 """
@@ -16,6 +17,7 @@ from .winapi import Monitor, exclude_from_capture
 CLASS_NAME = "AdaptiveScreenDimmerOverlay"
 _registered = False
 _message_hook: Callable[[int, int, int], None] | None = None
+_colors: dict[int, int] = {}  # hwnd -> COLORREF of that overlay
 
 EX_STYLE = (
     win32con.WS_EX_LAYERED
@@ -54,7 +56,13 @@ def _handle(hwnd: int, msg: int, wp: int, lp: int) -> int:
         return 1
     if msg == win32con.WM_PAINT:
         hdc, ps = win32gui.BeginPaint(hwnd)
-        win32gui.FillRect(hdc, win32gui.GetClientRect(hwnd), win32gui.GetStockObject(win32con.BLACK_BRUSH))
+        color = _colors.get(hwnd, 0)
+        if color:
+            brush = win32gui.CreateSolidBrush(color)
+            win32gui.FillRect(hdc, win32gui.GetClientRect(hwnd), brush)
+            win32gui.DeleteObject(brush)
+        else:
+            win32gui.FillRect(hdc, win32gui.GetClientRect(hwnd), win32gui.GetStockObject(win32con.BLACK_BRUSH))
         win32gui.EndPaint(hwnd, ps)
         return 0
     if msg == win32con.WM_CLOSE:
@@ -80,11 +88,12 @@ def _register() -> None:
 
 
 class Overlay:
-    def __init__(self, monitor: Monitor) -> None:
+    def __init__(self, monitor: Monitor, color: tuple[int, int, int] = (0, 0, 0)) -> None:
         _register()
         self.monitor = monitor
         self.alpha = 0
         self.visible = False
+        self.color = color
         m = monitor
         self.hwnd = win32gui.CreateWindowEx(
             EX_STYLE,
@@ -100,6 +109,7 @@ class Overlay:
             win32api.GetModuleHandle(None),
             None,
         )
+        _colors[self.hwnd] = win32api.RGB(*color)
         win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 0, win32con.LWA_ALPHA)
         # Excluded windows are invisible to screen capture, so the overlay never measures itself.
         self.excluded = exclude_from_capture(self.hwnd)
@@ -117,6 +127,15 @@ class Overlay:
             # A hidden overlay costs nothing and does not block fullscreen direct flip.
             win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
             self.visible = False
+
+    def set_color(self, color: tuple[int, int, int]) -> None:
+        if color == self.color:
+            return
+        self.color = color
+        _colors[self.hwnd] = win32api.RGB(*color)
+        win32gui.InvalidateRect(self.hwnd, None, False)
+        if self.visible:
+            win32gui.UpdateWindow(self.hwnd)
 
     def _show(self) -> None:
         m = self.monitor
@@ -152,6 +171,7 @@ class Overlay:
 
     def destroy(self) -> None:
         if self.hwnd:
+            _colors.pop(self.hwnd, None)
             try:
                 win32gui.DestroyWindow(self.hwnd)
             except win32gui.error:
