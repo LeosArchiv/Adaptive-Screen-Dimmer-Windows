@@ -109,6 +109,71 @@ def glare_level(stats: FrameStats, weight: float) -> float:
     return stats.mean + weight * strength * (stats.spot - stats.mean)
 
 
+LOCAL_CONTRAST = 6.0  # a glaring area is limited to this many times the background ...
+LOCAL_MIN_CAP = 96.0  # ... but never below this brightness (keeps normal highlights intact)
+LOCAL_MAX_ALPHA = 0.75  # never black out an area completely
+LOCAL_RELEASE_S = 0.3  # the mask fades out over roughly this time when the glare is gone
+
+
+def tile_means(tiles: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Mean brightness (0..255) of every tile, edge tiles weighted by their real size."""
+    gy, gx = tiles.shape
+    rows = np.minimum(TILE, height - np.arange(gy) * TILE)
+    cols = np.minimum(TILE, width - np.arange(gx) * TILE)
+    return tiles / (np.outer(rows, cols) * 3.0)
+
+
+def local_mask(means: np.ndarray, background: float, previous: np.ndarray | None, dt: float) -> np.ndarray:
+    """Per-tile overlay alpha (0..1) that darkens only glaring areas.
+
+    A tile brighter than ``cap`` (a multiple of the background the eyes are adapted to) is
+    darkened to about the cap: alpha = 1 - cap / brightness, because a black overlay scales the
+    displayed value by (1 - alpha). The mask is widened by one tile (covers the spot's soft rim
+    and a frame of motion) and blurred, so it has no hard block edges. It appears at once with
+    the glare but fades out over LOCAL_RELEASE_S: no pumping, no hard dark "ghost" jumping away.
+    """
+    return blend_mask(local_target(means, background), previous, dt)
+
+
+def local_target(means: np.ndarray, background: float) -> np.ndarray:
+    """The mask the current picture asks for (before temporal smoothing)."""
+    cap = max(LOCAL_MIN_CAP, max(background, GLARE_FLOOR) * LOCAL_CONTRAST)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        alpha = np.where(means > cap, 1.0 - cap / np.maximum(means, 1e-6), 0.0)
+    alpha = np.minimum(alpha, LOCAL_MAX_ALPHA)
+    alpha = _max3(alpha)  # widen by one tile
+    return _box3(_box3(alpha)).astype(np.float32)  # soften
+
+
+def blend_mask(target: np.ndarray, previous: np.ndarray | None, dt: float) -> np.ndarray:
+    """Appear at once, fade out over LOCAL_RELEASE_S."""
+    alpha = target
+    if previous is not None and previous.shape == target.shape:
+        decay = math.exp(-max(0.0, dt) / LOCAL_RELEASE_S)
+        alpha = np.maximum(target, previous * decay)
+    alpha = alpha.astype(np.float32)
+    alpha[alpha < 0.01] = 0.0
+    return alpha
+
+
+def _max3(a: np.ndarray) -> np.ndarray:
+    p = np.pad(a, 1, mode="edge")
+    out = a.copy()
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            np.maximum(out, p[dy : dy + a.shape[0], dx : dx + a.shape[1]], out=out)
+    return out
+
+
+def _box3(a: np.ndarray) -> np.ndarray:
+    p = np.pad(a, 1, mode="edge")
+    acc = np.zeros_like(a, dtype=np.float64)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            acc += p[dy : dy + a.shape[0], dx : dx + a.shape[1]]
+    return acc / 9.0
+
+
 def compensate(observed: float, alpha: float, tint_alpha: float = 0.0, tint_level: float = 0.0) -> float:
     """Undo overlays that are part of a capture (only when they cannot be excluded from it).
 

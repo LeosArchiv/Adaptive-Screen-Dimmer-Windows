@@ -7,6 +7,7 @@ All methods must be called from the thread that created the overlay (Win32 windo
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import win32api
 import win32con
@@ -94,7 +95,7 @@ class Overlay:
         self.alpha = 0
         self.visible = False
         self.color = color
-        self.below: Overlay | None = None  # keep this window directly under that one
+        self.below: Any = None  # a window (with .hwnd) to keep this one directly under
         m = monitor
         self.hwnd = win32gui.CreateWindowEx(
             EX_STYLE,

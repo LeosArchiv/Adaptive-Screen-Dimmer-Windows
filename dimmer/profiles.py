@@ -28,8 +28,9 @@ KELVIN_MIN, KELVIN_MAX = 1900, 6500
 TINT_MAX = 60  # percent; stronger tints wash the picture out too much
 MAX_OPACITY = 240  # never fully black
 # How strongly the brightest 128 px block counts compared to the mean (0 = only the mean).
-GLARE_WEIGHTS = (0.0, 0.6, 0.9)
-GLARE_LABELS = ("aus", "normal", "stark")
+GLARE_WEIGHTS = (0.0, 0.6, 0.9, 0.0)  # "lokal" darkens only the spot, not the whole screen
+GLARE_LABELS = ("aus", "normal", "stark", "lokal")
+GLARE_LOCAL = 3
 
 
 @dataclass
@@ -149,6 +150,7 @@ class Effective:
     tint_strength: float = 0  # percent
     glare_weight: float = 0.0
     protected_opacity: float = 0.0  # overlay alpha while the picture is unmeasurable (0 = off)
+    glare_local: bool = False  # darken only glaring areas (local dimming layer)
     label: str = ""
     reason: str = ""
 
@@ -163,6 +165,7 @@ def effective_of(p: Profile, reason: str = "") -> Effective:
         full=p.full,
         max_opacity=p.max_opacity if dim else 0,
         glare_weight=GLARE_WEIGHTS[p.glare] if dim else 0.0,
+        glare_local=dim and p.glare == GLARE_LOCAL,
         protected_opacity=p.protected_dim / 100 * 255 if dim else 0.0,
         attack=p.attack,
         release=p.release,
@@ -185,12 +188,15 @@ def overlay_app(base: Effective, app: Profile, exe: str) -> Effective:
             full=app.full,
             max_opacity=app.max_opacity,
             glare_weight=GLARE_WEIGHTS[app.glare],
+            glare_local=app.glare == GLARE_LOCAL,
             protected_opacity=app.protected_dim / 100 * 255,
             attack=app.attack,
             release=app.release,
         )
     elif app.dim_mode == OFF:
-        e = dataclasses.replace(e, dim_on=False, max_opacity=0, glare_weight=0.0, protected_opacity=0.0)
+        e = dataclasses.replace(
+            e, dim_on=False, max_opacity=0, glare_weight=0.0, glare_local=False, protected_opacity=0.0
+        )
     if app.tint_mode == OWN:
         on = app.tint_strength > 0
         e = dataclasses.replace(
@@ -226,6 +232,7 @@ def blend(a: Effective, b: Effective, t: float) -> Effective:
             a.glare_weight if a.dim_on else b.glare_weight, b.glare_weight if b.dim_on else a.glare_weight
         ),
         protected_opacity=mix(a.protected_opacity, b.protected_opacity),
+        glare_local=(a.glare_local if t < 0.5 else b.glare_local),
         attack=a.attack if t < 0.5 else b.attack,
         release=a.release if t < 0.5 else b.release,
         tint_on=a.tint_on or b.tint_on,

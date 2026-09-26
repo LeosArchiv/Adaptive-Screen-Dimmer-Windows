@@ -23,20 +23,24 @@ import numpy as np
 from . import overlay as overlay_mod
 from . import wgc
 from .gpu import GpuBrightness
+from .localdim import LocalDimmer
 from .logic import (
     ATTACK_PRESETS,
     RELEASE_PRESETS,
     FrameStats,
     Smoother,
+    blend_mask,
     brightness,
     compensate,
     frame_stats,
     glare_level,
+    local_target,
     target_opacity,
+    tile_means,
     tile_sums,
 )
 from .overlay import Overlay
-from .profiles import Effective, kelvin_to_rgb, resolve_monitor
+from .profiles import GLARE_WEIGHTS, Effective, kelvin_to_rgb, resolve_monitor
 from .settings import Settings
 from .winapi import Monitor, Sampler, apps_per_monitor, clear_monitor_id_cache, list_monitors, user32
 
@@ -119,6 +123,7 @@ MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
 PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
 FINGERPRINT_STEP = 8
+LOCAL_REDRAW_S = 0.033
 BLIND_SHARE = 0.9  # share of exactly black tiles that means "cannot see the picture"
 BLIND_AFTER_S = 1.5  # ... held this long (a cut to black in a film is shorter)
 WGC_RETRY_S = 30.0  # a monitor that fell back to GDI tries GPU capture again after this
@@ -196,6 +201,14 @@ class _Slot:
         self.wgc_retry_at = 0.0
         self.processed_at = 0.0
         self.stats = FrameStats.flat(0.0)
+        self.tiles: np.ndarray | None = None  # last GPU tile sums (for local dimming)
+        self.frame_size = (0, 0)
+        self.local: LocalDimmer | None = None
+        self.local_failed = False
+        self.mask: np.ndarray | None = None  # what the local layer shows
+        self.mask_target: np.ndarray | None = None  # what the current picture asks for
+        self._mask_moving = False
+        self._mask_shown_at = 0.0
         self.black_since: float | None = None  # picture exactly black (protected video?) since
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
@@ -272,6 +285,7 @@ class _Slot:
                     return None  # nothing new, or a new frame waits for its measuring slot
                 self.processed_at = now
                 tiles, w, h = result
+                self.tiles, self.frame_size = tiles, (w, h)
                 return frame_stats(tiles, w, h)
         m = self.monitor
         return self._sample_gdi(self.sampler.grab(m.left, m.top, m.width, m.height), want_tiles)
@@ -337,6 +351,7 @@ class _Slot:
             self.sampler = sampler
             self.monitor = monitor
             self.forget_frame()
+            self.stop_local()  # the mask grid depends on the monitor size
             self.stop_gpu_capture()  # the monitor handle may have changed: capture it anew
             self.start_gpu_capture()
 
@@ -363,15 +378,76 @@ class _Slot:
 
     def keep_on_top(self) -> None:
         # Dimming first (even while hidden, so its z position is always the reference), then the
-        # tint directly below it: the tint never covers the dimming, not even for a frame.
+        # local layer and the tint directly below it: nothing ever covers the dimming.
         self.dim.keep_on_top(even_hidden=True)
+        if self.local is not None:
+            self.local.keep_on_top(even_hidden=True)
         self.warm.keep_on_top()
+
+    # ---- local dimming ------------------------------------------------------------------------
+    @property
+    def local_active(self) -> bool:
+        """The local mask is still moving toward its target (fading in or out)."""
+        return self.mask is not None and self.mask_target is not None and self._mask_moving
+
+    def update_local(self, dt: float, fresh: bool) -> None:
+        """New frame: new mask target. Otherwise the picture is unchanged, so the target stays
+        (a paused film keeps its bright spot covered) and only a running fade continues."""
+        if self.tiles is None or self.gpu is None or self.local_failed:
+            return
+        if fresh:
+            w, h = self.frame_size
+            self.mask_target = local_target(tile_means(self.tiles, w, h), self.stats.background)
+        if self.mask_target is None:
+            return
+        now = time.perf_counter()
+        if not fresh and now - self._mask_shown_at < LOCAL_REDRAW_S:
+            return  # fades are redrawn at ~30 Hz, fast enough to look continuous
+        mask = blend_mask(self.mask_target, self.mask, now - self._mask_shown_at if self.mask is not None else dt)
+        if self.mask is not None and mask.shape == self.mask.shape and np.allclose(mask, self.mask, atol=0.004):
+            self._mask_moving = False
+            return  # nothing visible would change
+        self._mask_moving = not np.allclose(mask, self.mask_target, atol=0.004)
+        self.mask = mask
+        self._mask_shown_at = now
+        try:
+            if self.local is None:
+                self.local = LocalDimmer(self.gpu.gpu, self.monitor, mask.shape)
+                self.local.below = self.dim
+                self.warm.below = self.local  # order: dimming > local layer > tint
+            if self.local.grid_h != mask.shape[0] or self.local.grid_w != mask.shape[1]:
+                self.stop_local()
+                return
+            self.local.show_mask(mask)
+        except Exception as e:
+            log.warning("%s: lokales Abdunkeln nicht möglich (%s)", self.monitor.gdi_name, e)
+            self.local_failed = True
+            self.stop_local()
+
+    def stop_local(self) -> None:
+        self.mask = self.mask_target = None
+        self._mask_moving = False
+        if self.local is not None:
+            try:
+                self.local.close()
+            except Exception:
+                log.debug("local layer close failed", exc_info=True)
+            self.local = None
+            self.warm.below = self.dim
+
+    def hide_local(self) -> None:
+        self.mask = self.mask_target = None
+        self._mask_moving = False
+        if self.local is not None:
+            self.local.hide()
 
     def clear(self) -> None:
         """Fail-safe: hide both layers; each one independently of the other."""
         self.smoother.reset(0.0)
         self.tint_strength = 0.0
-        for layer in (self.overlay, self.tint):
+        self.mask = self.mask_target = None
+        self._mask_moving = False
+        for layer in (self.overlay, self.tint, self.local):
             if layer is None:
                 continue
             try:
@@ -380,6 +456,7 @@ class _Slot:
                 log.debug("could not hide overlay", exc_info=True)
 
     def close(self) -> None:
+        self.stop_local()
         self.stop_gpu_capture()
         if self.overlay:
             self.overlay.destroy()
@@ -660,7 +737,10 @@ class Engine(threading.Thread):
             else:
                 try:
                     want_tiles = e.glare_weight > 0 or e.protected_opacity > 0
-                    stats = slot.sample(want_tiles, self._settings.interval_ms / 1000.0)
+                    interval = self._settings.interval_ms / 1000.0
+                    if slot.local_active:
+                        interval = 0.033  # a visible local mask follows every frame (moving light)
+                    stats = slot.sample(want_tiles, interval)
                     slot.capture_failures = 0
                 except OSError as err:  # e.g. secure desktop (UAC, lock screen): keep last state
                     self._capture_failed(slot, err)
@@ -676,13 +756,17 @@ class Engine(threading.Thread):
                     and slot.dim.excluded
                     and not slot.tint_moving(False)
                     and not slot.blind_pending()
+                    and not slot.local_active
                 ):
                     continue  # fast path: no new frame, nothing moving, same profile -> no work
                 slot.computed_for = e
                 if stats is not None:
                     slot.stats = stats
                     slot.track_black(stats)
-                level = glare_level(slot.stats, e.glare_weight)
+                weight = e.glare_weight
+                if e.glare_local and slot.capture is None:
+                    weight = GLARE_WEIGHTS[2]  # no GPU tiles for a local mask: protect globally instead
+                level = glare_level(slot.stats, weight)
                 if not slot.dim.excluded:
                     # The alpha set one tick (>= 16 ms, several frames) ago is what the capture shows.
                     tint = slot.warm
@@ -698,6 +782,12 @@ class Engine(threading.Thread):
                     # protection applies instead of "no dimming".
                     slot.target = max(slot.target, e.protected_opacity)
                 smoother.step(slot.target, dt)
+                if e.glare_local and slot.capture is not None:
+                    slot.update_local(dt, fresh=stats is not None)
+                elif slot.local is not None:
+                    slot.hide_local()
+            if (self._paused or not e.dim_on) and slot.local is not None:
+                slot.hide_local()
             touched = True
             slot.dim.set_alpha(round(smoother.value))
             slot.step_tint(dt, off=self._paused)

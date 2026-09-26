@@ -17,12 +17,12 @@ from .engine import Engine, Status, wanted_devices
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS
 from .profiles import (
     AUTO,
+    GLARE_LABELS,
     INHERIT,
     KELVIN_MAX,
     KELVIN_MIN,
     OFF,
     OWN,
-    GLARE_LABELS,
     TINT_MAX,
     Profile,
     Rule,

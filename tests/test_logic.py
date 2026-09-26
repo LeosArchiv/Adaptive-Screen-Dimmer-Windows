@@ -3,13 +3,18 @@ import pytest
 
 from dimmer.logic import (
     ATTACK_PRESETS,
+    LOCAL_MAX_ALPHA,
     RELEASE_PRESETS,
     Smoother,
+    blend_mask,
     brightness,
     compensate,
     frame_stats,
     glare_level,
+    local_mask,
+    local_target,
     target_opacity,
+    tile_means,
     tile_sums,
 )
 
@@ -242,3 +247,46 @@ def test_hold_phase_is_not_settled() -> None:
     assert sm.value == 240 and not sm.settled
     values = [sm.step(0, 0.05) for _ in range(80)]
     assert values[-1] == 0 and sm.settled
+
+
+def test_local_mask_darkens_only_the_spot() -> None:
+    img = dark_scene()
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    means = tile_means(tile_sums(img), 1920, 1080)
+    mask = local_mask(means, st.background, None, 0.05)
+    spot_tile = mask[180 // 16, 1680 // 16]
+    assert 0.5 < spot_tile <= LOCAL_MAX_ALPHA  # 255 -> about the cap (96) -> alpha ~0.62
+    assert mask[600 // 16, 600 // 16] == 0.0  # the dark rest of the picture stays untouched
+    assert mask[50 // 16, 50 // 16] == 0.0
+
+
+def test_local_mask_ignores_normal_bright_content() -> None:
+    img = np.full((1080, 1920, 4), 200, np.uint8)  # a bright web page: global dimming's job
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    means = tile_means(tile_sums(img), 1920, 1080)
+    assert not local_mask(means, st.background, None, 0.05).any()
+
+
+def test_local_mask_fades_out_smoothly() -> None:
+    img = dark_scene()
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    mask = local_mask(tile_means(tile_sums(img), 1920, 1080), st.background, None, 0.05)
+    dark = np.full((68, 120), 12.0)
+    steps = [mask]
+    for _ in range(40):
+        steps.append(local_mask(dark, 12.0, steps[-1], 0.05))
+    peaks = [float(m.max()) for m in steps]
+    assert all(b <= a for a, b in zip(peaks, peaks[1:]))  # monotonic fade, no pumping
+    assert max(a - b for a, b in zip(peaks, peaks[1:])) < 0.2  # no hard jump
+    assert peaks[-1] == 0.0
+
+
+def test_mask_target_is_kept_while_the_picture_does_not_change() -> None:
+    """A paused film: no new frames, the bright spot must stay covered."""
+    img = dark_scene()
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    target = local_target(tile_means(tile_sums(img), 1920, 1080), st.background)
+    mask = blend_mask(target, None, 0.05)
+    for _ in range(100):
+        mask = blend_mask(target, mask, 0.05)
+    assert mask[180 // 16, 1680 // 16] > 0.5
