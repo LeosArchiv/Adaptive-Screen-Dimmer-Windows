@@ -7,7 +7,10 @@ from dimmer.logic import (
     Smoother,
     brightness,
     compensate,
+    frame_stats,
+    glare_level,
     target_opacity,
+    tile_sums,
 )
 
 # The mapping of the original single-file version, kept verbatim as reference.
@@ -173,3 +176,43 @@ def test_compensate_with_tint_below_dimming(true_level: float) -> None:
     after_tint = true_level * (1 - tint / 255) + tint_level * tint / 255
     observed = after_tint * (1 - dim / 255)
     assert compensate(observed, dim, tint, tint_level) == pytest.approx(true_level, abs=1e-6)
+
+
+def test_frame_stats_mean_matches_brightness() -> None:
+    img = np.random.default_rng(5).integers(0, 256, (1000, 1500, 4), dtype=np.uint8)
+    mean, spot = frame_stats(tile_sums(img), 1500, 1000)
+    assert mean == pytest.approx(brightness(img), abs=1e-9)
+    assert spot >= mean
+
+
+def test_spot_finds_flashlight_in_dark_scene() -> None:
+    img = np.full((1080, 1920, 4), 12, np.uint8)  # dark film scene
+    img[100:260, 1600:1760, :3] = 255  # small white flashlight spot (~1.2 % of the screen)
+    mean, spot = frame_stats(tile_sums(img), 1920, 1080)
+    assert mean < 20  # the mean hides it ...
+    assert spot > 240  # ... the spot value does not
+    assert glare_level(mean, spot, 0.5) > 100  # enough to trigger dimming
+
+
+def test_small_bright_text_is_not_a_spot() -> None:
+    img = np.full((1080, 1920, 4), 30, np.uint8)  # dark IDE
+    img[200:1000:20, 100:900, :3] = 220  # 1 px bright text lines every 20 px
+    mean, spot = frame_stats(tile_sums(img), 1920, 1080)
+    assert spot < 60
+
+
+def test_edge_slivers_do_not_count_as_blocks() -> None:
+    img = np.zeros((1080, 1924, 4), np.uint8)
+    img[:, 1920:, :3] = 255  # 4 px bright column at the right edge
+    _mean, spot = frame_stats(tile_sums(img), 1924, 1080)
+    assert spot < 10
+
+
+def test_hold_phase_is_not_settled() -> None:
+    """Callers skip settled smoothers; during the hold before brightening it must keep stepping."""
+    sm = Smoother(hold=0.4)
+    sm.reset(240)
+    sm.step(0, 0.05)
+    assert sm.value == 240 and not sm.settled
+    values = [sm.step(0, 0.05) for _ in range(80)]
+    assert values[-1] == 0 and sm.settled

@@ -21,7 +21,19 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import overlay as overlay_mod
-from .logic import ATTACK_PRESETS, RELEASE_PRESETS, Smoother, brightness, compensate, target_opacity
+from . import wgc
+from .gpu import GpuBrightness
+from .logic import (
+    ATTACK_PRESETS,
+    RELEASE_PRESETS,
+    Smoother,
+    brightness,
+    compensate,
+    frame_stats,
+    glare_level,
+    target_opacity,
+    tile_sums,
+)
 from .overlay import Overlay
 from .profiles import Effective, kelvin_to_rgb, resolve_monitor
 from .settings import Settings
@@ -84,6 +96,21 @@ user32.MsgWaitForMultipleObjects.argtypes = [
 ]
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 QS_ALLINPUT = 0x04FF
+CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2
+TIMER_ALL_ACCESS = 0x1F0003
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.CreateWaitableTimerExW.restype = wintypes.HANDLE
+kernel32.CreateWaitableTimerExW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+kernel32.SetWaitableTimer.restype = wintypes.BOOL
+kernel32.SetWaitableTimer.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(ctypes.c_longlong),
+    ctypes.c_long,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    wintypes.BOOL,
+]
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 TINT_RATE = 25.0  # percent per second: profile changes blend the tint in ~1 s
 KELVIN_RATE = 3000.0  # kelvin per second
@@ -91,6 +118,9 @@ MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
 PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
 FINGERPRINT_STEP = 8
+WGC_RETRY_S = 30.0  # a monitor that fell back to GDI tries GPU capture again after this
+STATUS_REFRESH_S = 0.25
+WGC_MIN_INTERVAL_S = 0.016  # GPU capture: polling is nearly free, so poll up to ~60x per second
 APP_CONFIRM = 2  # consecutive sightings before a monitor switches to another app's profile
 IDLE_AFTER_S = 2.0  # screen unchanged this long -> slower measuring
 IDLE_FACTOR = 2.0  # at most 100 ms extra latency for a flash after a still phase
@@ -116,6 +146,8 @@ class MonitorStatus:
     tint: float = 0.0  # current blue-light filter strength in percent
     start: float | None = None  # thresholds in effect (None: dimming off), for the meter
     full: float | None = None
+    spot: float = 0.0  # brightest 128 px block
+    capture: str = ""  # "GPU" (Windows.Graphics.Capture) or "GDI" (fallback)
 
 
 @dataclass
@@ -130,12 +162,37 @@ class Status:
     heartbeat: float = 0.0  # time.monotonic() of the last engine loop round
 
 
+class _GpuContext:
+    """One D3D11 device + its WinRT wrapper, shared by all monitor captures (engine thread)."""
+
+    def __init__(self) -> None:
+        self.gpu = GpuBrightness()
+        try:
+            self.device = wgc.WinrtDevice(self.gpu)
+        except Exception:
+            self.gpu.close()
+            raise
+
+    def close(self) -> None:
+        self.device.close()
+        self.gpu.close()
+
+
 class _Slot:
     """Per-monitor state owned by the engine thread."""
 
-    def __init__(self, monitor: Monitor, index: int) -> None:
+    def __init__(
+        self, monitor: Monitor, index: int, gpu: _GpuContext | None = None, min_interval: float = 0.05
+    ) -> None:
         self.monitor = monitor
+        self.min_interval = min_interval  # measuring interval; GPU frames are not needed faster
         self.index = index
+        self.gpu = gpu
+        self.capture: wgc.MonitorCapture | None = None
+        self.wgc_retry_at = 0.0
+        self.processed_at = 0.0
+        self.mean = 0.0
+        self.spot = 0.0
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
         self.sampler = Sampler()
@@ -152,8 +209,9 @@ class _Slot:
         self.level = 0.0
         self.target = 0.0
         self.capture_failures = 0
+        self.computed_for: Effective | None = None  # profile values the current target was computed for
         self._fingerprint: np.ndarray | None = None
-        self._fingerprint_level = 0.0
+        self._fingerprint_spot = False
         self.effective = Effective()
         self.app: str | None = None
         self.app_known = False
@@ -161,21 +219,80 @@ class _Slot:
         self.pending_hits = 0
         self.tint_strength = 0.0  # current, fades toward effective.tint_strength
         self.tint_kelvin = 3400.0
+        self.start_gpu_capture()
 
-    def measure(self, pixels: np.ndarray) -> float:
-        """Exact mean brightness, skipped when the frame is unchanged.
+    # ---- measuring -------------------------------------------------------------------------
+    @property
+    def backend(self) -> str:
+        return "GPU" if self.capture else "GDI"
+
+    def start_gpu_capture(self) -> None:
+        if self.gpu is None or self.capture is not None:
+            return
+        try:
+            self.capture = wgc.MonitorCapture(self.gpu.gpu, self.gpu.device, self.monitor.hmonitor)
+            self.capture.set_min_interval(self.min_interval)
+            self.forget_frame()
+            log.info("%s: GPU-Aufnahme (Windows.Graphics.Capture)", self.monitor.gdi_name)
+        except Exception as e:
+            self.capture = None
+            self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
+            log.warning("%s: GPU-Aufnahme nicht möglich (%s) – GDI wird genutzt", self.monitor.gdi_name, e)
+
+    def stop_gpu_capture(self) -> None:
+        if self.capture is not None:
+            try:
+                self.capture.close()
+            except Exception:
+                log.debug("capture close failed", exc_info=True)
+            self.capture = None
+
+    def sample(self, want_spot: bool, process_interval: float) -> tuple[float, float] | None:
+        """(mean, brightest block) of the current picture, or None when it did not change.
+
+        GPU capture: polled at display rate, but measured at most every ``process_interval``
+        (continuous change such as video would otherwise cost GPU work 60x per second). The
+        first frame after a still phase is measured at once, so flashes are not delayed.
+        """
+        if self.capture is not None:
+            now = time.perf_counter()
+            due = now - self.processed_at >= process_interval
+            try:
+                result = self.capture.poll(process=due)
+            except Exception as e:
+                log.warning("%s: GPU-Aufnahme fehlgeschlagen (%s) – wechsle zu GDI", self.monitor.gdi_name, e)
+                self.stop_gpu_capture()
+                self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
+            else:
+                if result is None:
+                    return None  # nothing new, or a new frame waits for its measuring slot
+                self.processed_at = now
+                tiles, w, h = result
+                return frame_stats(tiles, w, h)
+        m = self.monitor
+        return self._sample_gdi(self.sampler.grab(m.left, m.top, m.width, m.height), want_spot)
+
+    def _sample_gdi(self, pixels: np.ndarray, want_spot: bool) -> tuple[float, float] | None:
+        """GDI fallback: exact values, skipped when the frame is unchanged.
 
         A fixed coarse grid (every 8th pixel) is compared with the previous frame first; the
-        exact sum over all pixels (the most expensive step) only runs when something changed.
-        A change missing every grid point is smaller than 8x8 pixels and moves the mean by
-        less than 0.01, far below anything visible.
+        exact sums (the most expensive step) only run when something changed. A change missing
+        every grid point is smaller than 8x8 pixels and moves the mean by less than 0.01.
         """
         fingerprint = pixels[::FINGERPRINT_STEP, ::FINGERPRINT_STEP, :3]
-        if self._fingerprint is not None and np.array_equal(fingerprint, self._fingerprint):
-            return self._fingerprint_level
+        if (
+            self._fingerprint is not None
+            and self._fingerprint_spot == want_spot
+            and np.array_equal(fingerprint, self._fingerprint)
+        ):
+            return None
         self._fingerprint = fingerprint.copy()
-        self._fingerprint_level = brightness(pixels)
-        return self._fingerprint_level
+        self._fingerprint_spot = want_spot
+        if want_spot:
+            h, w = pixels.shape[:2]
+            return frame_stats(tile_sums(pixels), w, h)
+        mean = brightness(pixels)
+        return mean, mean
 
     def forget_frame(self) -> None:
         self._fingerprint = None
@@ -200,6 +317,8 @@ class _Slot:
             self.sampler = sampler
             self.monitor = monitor
             self.forget_frame()
+            self.stop_gpu_capture()  # the monitor handle may have changed: capture it anew
+            self.start_gpu_capture()
 
     def renew_sampler(self) -> None:
         sampler = Sampler()
@@ -241,6 +360,7 @@ class _Slot:
                 log.debug("could not hide overlay", exc_info=True)
 
     def close(self) -> None:
+        self.stop_gpu_capture()
         if self.overlay:
             self.overlay.destroy()
         if self.tint:
@@ -288,6 +408,11 @@ class Engine(threading.Thread):
         self._force_refresh = False
         self._hook: list[int] = []
         self._hook_proc = WinEventProc(self._on_win_event)
+        self._gpu: _GpuContext | None = None
+        self._timer = 0  # high-resolution waitable timer, created on the engine thread
+        self._published_key: tuple = ()
+        self._published_at = 0.0
+        self.use_gpu = True  # tests can force the GDI path
 
     # ---- public, thread-safe ---------------------------------------------------------
     def post(self, command: Callable[[], None]) -> None:
@@ -340,6 +465,10 @@ class Engine(threading.Thread):
         self._thread_id = threading.get_native_id()
         try:
             overlay_mod.set_message_hook(self._on_window_message)
+            self._timer = kernel32.CreateWaitableTimerExW(
+                None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS
+            ) or kernel32.CreateWaitableTimerExW(None, None, 0, TIMER_ALL_ACCESS)  # older Windows
+            self._start_gpu()
             self._register_hotkey()
             self._install_hook()
             try:
@@ -371,7 +500,7 @@ class Engine(threading.Thread):
                 if self._stop_event.is_set():
                     break
                 now = time.perf_counter()
-                base = self._settings.interval_ms / 1000.0
+                base = self._base_interval()
                 if self._wake_now:
                     # New window / focus / title change: measure soon, after the window had a
                     # moment to paint, never above the base rate. Whether idle mode ends is
@@ -384,6 +513,7 @@ class Engine(threading.Thread):
                     next_monitor_check = now + MONITOR_CHECK_S
                     self._refresh_monitors(force=self._force_refresh)
                     self._force_refresh = False
+                    self._retry_gpu_captures()
                 if now >= next_fg:
                     self._resolve_profiles()
                     next_fg = now + PROFILE_CHECK_S
@@ -451,23 +581,52 @@ class Engine(threading.Thread):
             except Exception:
                 log.debug("pump failed during backoff", exc_info=True)
 
+    def _start_gpu(self) -> None:
+        if not self.use_gpu:
+            return
+        try:
+            if not wgc.init_thread() or not wgc.is_supported():
+                raise OSError("Windows.Graphics.Capture not supported")
+            self._gpu = _GpuContext()
+        except Exception as e:
+            self._gpu = None
+            log.warning("GPU-Aufnahme nicht verfügbar (%s) – GDI wird genutzt", e)
+
+    def _retry_gpu_captures(self) -> None:
+        now = time.monotonic()
+        for slot in self._slots.values():
+            if self._gpu and slot.capture is None and now >= slot.wgc_retry_at:
+                slot.start_gpu_capture()
+
+    def _all_gpu(self) -> bool:
+        return bool(self._slots) and all(slot.capture is not None for slot in self._slots.values())
+
+    def _base_interval(self) -> float:
+        """GPU capture polls are nearly free (no new frame = no work), so they run at about the
+        display rate: a flash is seen within one or two frames instead of one GDI interval."""
+        base = self._settings.interval_ms / 1000.0
+        if self._all_gpu():
+            return max(WGC_MIN_INTERVAL_S, base / 3)
+        return base
+
     def _any_moving(self) -> bool:
         return any(not slot.smoother.settled or slot.tint_moving(self._paused) for slot in self._slots.values())
 
     def _current_interval(self, calm_for: float) -> float:
         """Full rate while anything moves; a slower rate once every monitor has been still."""
-        base = self._settings.interval_ms / 1000.0
+        base = self._base_interval()
         if self._any_moving():
             return base  # a running fade always gets full rate, or it would show as steps
         if self._paused or not any(slot.effective.dim_on for slot in self._slots.values()):
             return max(base, IDLE_INTERVAL_MAX_S)  # nothing to measure
-        if calm_for >= IDLE_AFTER_S:
+        if calm_for >= IDLE_AFTER_S and not self._all_gpu():  # GDI only: a still screen is measured less often
             return min(max(base, base * IDLE_FACTOR), max(base, IDLE_INTERVAL_MAX_S))
         return base
 
     def _tick(self, dt: float) -> bool:
         """One measurement/update round. Returns True when something changed noticeably."""
         active = False
+        touched = False
         for slot in self._slots.values():
             e = slot.effective
             smoother = slot.smoother
@@ -480,8 +639,7 @@ class Engine(threading.Thread):
                 smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
             else:
                 try:
-                    m = slot.monitor
-                    level = slot.measure(slot.sampler.grab(m.left, m.top, m.width, m.height))
+                    stats = slot.sample(e.glare_weight > 0, self._settings.interval_ms / 1000.0)
                     slot.capture_failures = 0
                 except OSError as err:  # e.g. secure desktop (UAC, lock screen): keep last state
                     self._capture_failed(slot, err)
@@ -490,6 +648,18 @@ class Engine(threading.Thread):
                         slot.dim.set_alpha(round(smoother.value))
                     slot.step_tint(dt, off=False)
                     continue
+                if (
+                    stats is None
+                    and e is slot.computed_for
+                    and smoother.settled
+                    and slot.dim.excluded
+                    and not slot.tint_moving(False)
+                ):
+                    continue  # fast path: no new frame, nothing moving, same profile -> no work
+                slot.computed_for = e
+                if stats is not None:
+                    slot.mean, slot.spot = stats
+                level = glare_level(slot.mean, slot.spot, e.glare_weight)
                 if not slot.dim.excluded:
                     # The alpha set one tick (>= 16 ms, several frames) ago is what the capture shows.
                     tint = slot.warm
@@ -500,11 +670,13 @@ class Engine(threading.Thread):
                 slot.level = level
                 slot.target = target_opacity(level, e.start, e.full, e.max_opacity)
                 smoother.step(slot.target, dt)
+            touched = True
             slot.dim.set_alpha(round(smoother.value))
             slot.step_tint(dt, off=self._paused)
             if not smoother.settled or slot.tint_moving(self._paused):
                 active = True
-        self._publish()
+        if touched or time.monotonic() - self._published_at >= STATUS_REFRESH_S:
+            self._publish_if_changed()
         return active
 
     def _capture_failed(self, slot: _Slot, error: OSError) -> None:
@@ -518,11 +690,22 @@ class Engine(threading.Thread):
             slot.renew_sampler()
 
     def _wait(self, seconds: float) -> None:
-        if self._wake_now or self._stop_event.is_set():
+        """Sleep until the next deadline or a message, whichever comes first.
+
+        A plain timeout is rounded up to the 15.6 ms system tick (a 16 ms wait becomes 31 ms).
+        A high-resolution waitable timer is precise without changing the system-wide timer
+        resolution (no timeBeginPeriod, no extra power use elsewhere).
+        """
+        if self._wake_now or self._stop_event.is_set() or seconds <= 0:
             return
-        ms = max(0, math.ceil(seconds * 1000))
-        if ms:
-            user32.MsgWaitForMultipleObjects(0, None, False, ms, QS_ALLINPUT)
+        timer = self._timer
+        if timer:
+            due = ctypes.c_longlong(-max(1, int(seconds * 10_000_000)))  # relative, 100 ns units
+            if kernel32.SetWaitableTimer(timer, ctypes.byref(due), 0, None, None, False):
+                handles = (wintypes.HANDLE * 1)(timer)
+                user32.MsgWaitForMultipleObjects(1, handles, False, math.ceil(seconds * 1000) + 20, QS_ALLINPUT)
+                return
+        user32.MsgWaitForMultipleObjects(0, None, False, max(1, math.ceil(seconds * 1000)), QS_ALLINPUT)
 
     def _pump(self) -> None:
         msg = wintypes.MSG()
@@ -553,6 +736,11 @@ class Engine(threading.Thread):
     def _apply_settings(self, s: Settings) -> None:
         old = self._settings
         self._settings = s
+        if s.interval_ms != old.interval_ms:
+            for slot in self._slots.values():
+                slot.min_interval = s.interval_ms / 1000.0
+                if slot.capture is not None:
+                    slot.capture.set_min_interval(slot.min_interval)
         if s.hotkey != old.hotkey:
             self._unregister_hotkey()
             self._register_hotkey()
@@ -627,7 +815,7 @@ class Engine(threading.Thread):
                 # Keep window and smoother: a resolution/arrangement change must not flash.
                 slot.update_geometry(monitor, index)
                 continue
-            slot = _Slot(monitor, index)
+            slot = _Slot(monitor, index, self._gpu, self._settings.interval_ms / 1000.0)
             self._slots[device] = slot
             self._resolve_profiles()
             if not slot.dim.excluded:
@@ -635,6 +823,14 @@ class Engine(threading.Thread):
         with self._lock:
             self._monitors = monitors
         self._publish()
+
+    def _publish_if_changed(self) -> None:
+        """At display rate most rounds change nothing; the GUI needs at most ~10 updates/s."""
+        key = tuple((s.dim.alpha, round(s.tint_strength), round(s.mean), round(s.spot)) for s in self._slots.values())
+        now = time.monotonic()
+        if key != self._published_key or now - self._published_at >= STATUS_REFRESH_S:
+            self._published_key, self._published_at = key, now
+            self._publish()
 
     def _publish(self) -> None:
         index = {m.device: i for i, m in enumerate(self._monitors)}
@@ -652,6 +848,8 @@ class Engine(threading.Thread):
                 tint=slot.tint_strength,
                 start=slot.effective.start if slot.effective.dim_on else None,
                 full=slot.effective.full if slot.effective.dim_on else None,
+                spot=slot.spot,
+                capture=slot.backend,
             )
             for d, slot in sorted(self._slots.items(), key=lambda kv: index.get(kv[0], 99))
         ]
@@ -704,11 +902,20 @@ class Engine(threading.Thread):
             except Exception:
                 log.exception("Overlay cleanup failed")
         self._slots.clear()
+        if self._gpu is not None:
+            try:
+                self._gpu.close()
+            except Exception:
+                log.debug("GPU cleanup failed", exc_info=True)
+            self._gpu = None
         for h in self._hook:
             if h:
                 user32.UnhookWinEvent(h)
         self._unregister_hotkey()
         overlay_mod.set_message_hook(None)
+        if self._timer:
+            kernel32.CloseHandle(self._timer)
+            self._timer = 0
         with self._lock:
             self._status.running = False
             self._status.monitors = []

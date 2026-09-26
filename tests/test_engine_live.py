@@ -130,3 +130,19 @@ def test_app_rule_switches_profile_only_on_that_monitor(engine: Engine, monkeypa
     assert rows[ids[0]].profile == "Spiel" and rows[ids[0]].app == "game.exe"
     for other in ids[1:]:
         assert rows[other].profile == "Test"
+
+
+def test_gpu_capture_is_used_and_gdi_fallback_works() -> None:
+    enable_dpi_awareness()
+    for use_gpu, expected in ((True, "GPU"), (False, "GDI")):
+        e = Engine(quiet())
+        e.use_gpu = use_gpu
+        e.start()
+        try:
+            assert e.wait_ready(5)
+            time.sleep(0.6)
+            st = e.snapshot()
+            assert st.running and not st.error
+            assert st.monitors[0].capture == expected
+        finally:
+            e.stop()

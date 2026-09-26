@@ -27,6 +27,9 @@ AUTO = "auto"  # base profile of a monitor chosen by the day/night schedule
 KELVIN_MIN, KELVIN_MAX = 1900, 6500
 TINT_MAX = 60  # percent; stronger tints wash the picture out too much
 MAX_OPACITY = 240  # never fully black
+# How strongly the brightest 128 px block counts compared to the mean (0 = only the mean).
+GLARE_WEIGHTS = (0.0, 0.5, 0.7)
+GLARE_LABELS = ("aus", "normal", "stark")
 
 
 @dataclass
@@ -41,6 +44,7 @@ class Profile:
     tint_mode: str = OFF
     tint_kelvin: int = 3400
     tint_strength: int = 25  # percent
+    glare: int = 0  # protection against small bright spots in dark pictures: 0 off, 1 normal, 2 strong
 
     @property
     def builtin(self) -> bool:
@@ -60,6 +64,7 @@ class Profile:
             p.release = "Normal"
         p.tint_kelvin = clamp(p.tint_kelvin, KELVIN_MIN, KELVIN_MAX)
         p.tint_strength = clamp(p.tint_strength, 0, TINT_MAX)
+        p.glare = clamp(p.glare, 0, len(GLARE_WEIGHTS) - 1)
         if p.builtin:
             p.dim_mode = OFF
             p.tint_mode = OFF
@@ -85,10 +90,14 @@ class Schedule:
 def default_profiles() -> list[Profile]:
     return [
         Profile("Tag"),
-        Profile("Nacht", start=15, full=70, release="Langsam", tint_mode=OWN, tint_kelvin=3400, tint_strength=30),
+        Profile(
+            "Nacht", start=15, full=70, release="Langsam", tint_mode=OWN, tint_kelvin=3400, tint_strength=30, glare=1
+        ),
         Profile("Arbeit", start=40, full=140, max_opacity=200, attack="Sanft", tint_mode=INHERIT),
         Profile("Zocken", start=30, full=110, max_opacity=230, attack="Sofort", release="Schnell", tint_mode=INHERIT),
-        Profile("Filme", start=60, full=170, max_opacity=160, attack="Sanft", release="Langsam", tint_mode=INHERIT),
+        Profile(
+            "Filme", start=60, full=170, max_opacity=160, attack="Sanft", release="Langsam", tint_mode=INHERIT, glare=1
+        ),
         Profile(OFF_PROFILE, dim_mode=OFF, tint_mode=OFF),
     ]
 
@@ -136,6 +145,7 @@ class Effective:
     tint_on: bool = False
     tint_kelvin: float = 3400
     tint_strength: float = 0  # percent
+    glare_weight: float = 0.0
     label: str = ""
     reason: str = ""
 
@@ -149,6 +159,7 @@ def effective_of(p: Profile, reason: str = "") -> Effective:
         start=p.start,
         full=p.full,
         max_opacity=p.max_opacity if dim else 0,
+        glare_weight=GLARE_WEIGHTS[p.glare] if dim else 0.0,
         attack=p.attack,
         release=p.release,
         tint_on=tint,
@@ -169,6 +180,7 @@ def overlay_app(base: Effective, app: Profile, exe: str) -> Effective:
             start=app.start,
             full=app.full,
             max_opacity=app.max_opacity,
+            glare_weight=GLARE_WEIGHTS[app.glare],
             attack=app.attack,
             release=app.release,
         )
@@ -205,6 +217,9 @@ def blend(a: Effective, b: Effective, t: float) -> Effective:
         start=mix(a.start if a.dim_on else b.start, b.start if b.dim_on else a.start),
         full=mix(a.full if a.dim_on else b.full, b.full if b.dim_on else a.full),
         max_opacity=mix(a.max_opacity, b.max_opacity),
+        glare_weight=mix(
+            a.glare_weight if a.dim_on else b.glare_weight, b.glare_weight if b.dim_on else a.glare_weight
+        ),
         attack=a.attack if t < 0.5 else b.attack,
         release=a.release if t < 0.5 else b.release,
         tint_on=a.tint_on or b.tint_on,

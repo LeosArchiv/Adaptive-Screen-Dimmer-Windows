@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import win32api
@@ -100,6 +100,7 @@ class Monitor:
     height: int
     primary: bool
     gdi_name: str = ""  # e.g. "\\\\.\\DISPLAY2"; Windows renumbers these, so only for logs
+    hmonitor: int = field(default=0, compare=False)  # handle for capture APIs
 
     @property
     def rect(self) -> tuple[int, int, int, int]:
@@ -150,6 +151,7 @@ def list_monitors() -> list[Monitor]:
             Monitor(
                 device=_stable_id(gdi_name, (left, top, right, bottom)),
                 gdi_name=gdi_name,
+                hmonitor=int(hmon),
                 left=left,
                 top=top,
                 width=right - left,
