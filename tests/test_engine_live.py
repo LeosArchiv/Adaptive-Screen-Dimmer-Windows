@@ -7,14 +7,14 @@ import time
 import pytest
 
 from dimmer.engine import Engine
-from dimmer.profiles import Profile, Rule
+from dimmer.profiles import Profile
 from dimmer.settings import Settings
 from dimmer.winapi import enable_dpi_awareness
 
 
 def quiet(**kw) -> Settings:
-    """Real overlays that never visibly dim or tint (one profile, strongest dimming 0)."""
-    return Settings(profiles=[Profile("Test", max_opacity=0)], rules=[], hotkey=False, **kw)
+    """Real overlays that never visibly dim or tint (strongest dimming 0, no tint)."""
+    return Settings(profile=Profile(max_opacity=0), hotkey=False, **kw)
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASD_LIVE_TESTS") != "1", reason="set ASD_LIVE_TESTS=1")
@@ -103,35 +103,11 @@ def test_persistent_errors_keep_engine_controllable(engine: Engine, monkeypatch:
     assert engine.snapshot().paused_reason == "user"
 
 
-def test_status_reports_profile_and_app(engine: Engine) -> None:
+def test_status_reports_thresholds(engine: Engine) -> None:
     time.sleep(0.6)
     m = engine.snapshot().monitors[0]
-    assert m.profile == "Test"
+    assert (m.start, m.full) == (30, 160)
     assert m.tint == 0.0
-
-
-def test_app_rule_switches_profile_only_on_that_monitor(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-    import dimmer.engine as engine_mod
-
-    monitors = engine.monitors()
-    ids = [m.device for m in monitors]
-    fake_app = {ids[0]: "game.exe"}
-    monkeypatch.setattr(
-        engine_mod, "windows_per_monitor", lambda mons: {m.device: (fake_app.get(m.device), "") for m in mons}
-    )
-    engine.update_settings(
-        Settings(
-            profiles=[Profile("Test", max_opacity=0), Profile("Spiel", max_opacity=0, attack="Sofort")],
-            rules=[Rule("game.exe", "Spiel")],
-            monitors=ids,
-            hotkey=False,
-        )
-    )
-    time.sleep(0.8)
-    rows = {m.device: m for m in engine.snapshot().monitors}
-    assert rows[ids[0]].profile == "Spiel" and rows[ids[0]].app == "game.exe"
-    for other in ids[1:]:
-        assert rows[other].profile == "Test"
 
 
 def test_gpu_capture_is_used_and_gdi_fallback_works() -> None:

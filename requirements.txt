@@ -1,2 +1,3 @@
 numpy>=1.24
 pywin32>=305
+pywebview>=5.0

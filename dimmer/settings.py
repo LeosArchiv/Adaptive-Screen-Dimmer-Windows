@@ -9,21 +9,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .profiles import (
-    AUTO,
-    OFF_PROFILE,
-    Profile,
-    Rule,
-    Schedule,
-    clamp,
-    default_profiles,
-    default_rules,
-    format_hhmm,
-    parse_hhmm,
-)
+from .profiles import Profile, clamp
 
 APP_NAME = "AdaptiveScreenDimmer"
-VERSION = 2
+VERSION = 3
+GENERAL_KEYS = ("monitors", "interval_ms", "hotkey", "start_paused", "close_to_tray", "start_minimized")
 
 
 def config_dir() -> Path:
@@ -36,11 +26,8 @@ def config_dir() -> Path:
 
 @dataclass
 class Settings:
-    profiles: list[Profile] = field(default_factory=default_profiles)
-    rules: list[Rule] = field(default_factory=default_rules)
-    schedule: Schedule = field(default_factory=Schedule)
+    profile: Profile = field(default_factory=Profile)
     monitors: list[str] = field(default_factory=list)  # stable monitor ids; empty = primary only
-    monitor_profiles: dict[str, str] = field(default_factory=dict)  # monitor id -> profile or "auto"
     interval_ms: int = 50  # measurement interval
     hotkey: bool = True
     start_paused: bool = False
@@ -48,67 +35,11 @@ class Settings:
     start_minimized: bool = False
     version: int = VERSION
 
-    # ---- helpers ---------------------------------------------------------------------
-    def profile_map(self) -> dict[str, Profile]:
-        return {p.name: p for p in self.profiles}
-
-    def rule_map(self) -> dict[str, str]:
-        """Program-only rules (exe -> profile)."""
-        return {r.exe: r.profile for r in self.rules if r.exe and not r.title}
-
-    def base_choice(self, device: str) -> str:
-        return self.monitor_profiles.get(device, AUTO)
-
     def normalized(self) -> Settings:
         s = dataclasses.replace(self)
-        # profiles: valid, unique names, built-in "Aus" always present
-        profiles: list[Profile] = []
-        seen: set[str] = set()
-        for p in s.profiles if isinstance(s.profiles, list) else []:
-            if not isinstance(p, Profile):
-                continue
-            p = p.normalized()
-            if p.name in seen:
-                continue
-            seen.add(p.name)
-            profiles.append(p)
-        if not any(not p.builtin for p in profiles):
-            profiles = [p for p in default_profiles() if not p.builtin] + [p for p in profiles if p.builtin]
-            seen = {p.name for p in profiles}
-        if OFF_PROFILE not in seen:
-            profiles.append(Profile(OFF_PROFILE).normalized())
-        s.profiles = profiles
-        names = {p.name for p in profiles}
-        first = next(p.name for p in profiles if not p.builtin)
-
-        rules: dict[tuple[str, str], str] = {}
-        for r in s.rules if isinstance(s.rules, list) else []:
-            if not isinstance(r, Rule) or not isinstance(r.exe, str) or not isinstance(r.profile, str):
-                continue
-            title = r.title.strip()[:80] if isinstance(r.title, str) else ""
-            exe = r.exe.strip().lower()
-            if (exe or title) and r.profile in names:
-                rules[(exe, title)] = r.profile
-        s.rules = [Rule(exe, prof, title) for (exe, title), prof in sorted(rules.items())]
-
-        sch = s.schedule if isinstance(s.schedule, Schedule) else Schedule()
-        sch = dataclasses.replace(
-            sch,
-            enabled=sch.enabled if isinstance(sch.enabled, bool) else True,
-            day_profile=sch.day_profile if isinstance(sch.day_profile, str) and sch.day_profile in names else first,
-            night_profile=(
-                sch.night_profile if isinstance(sch.night_profile, str) and sch.night_profile in names else first
-            ),
-            day_start=format_hhmm(parse_hhmm(sch.day_start, 7 * 60)),
-            night_start=format_hhmm(parse_hhmm(sch.night_start, 20 * 60)),
-            fade_minutes=clamp(sch.fade_minutes, 0, 180),
-        )
-        s.schedule = sch
-
+        s.profile = s.profile.normalized() if isinstance(s.profile, Profile) else Profile()
         monitors = s.monitors if isinstance(s.monitors, list) else []
         s.monitors = [m for m in monitors if isinstance(m, str)]
-        mp = s.monitor_profiles if isinstance(s.monitor_profiles, dict) else {}
-        s.monitor_profiles = {str(k): v for k, v in mp.items() if isinstance(v, str) and (v in names) and v != AUTO}
         s.interval_ms = clamp(s.interval_ms, 16, 500)
         defaults = Settings()
         for name in ("hotkey", "start_paused", "close_to_tray", "start_minimized"):
@@ -119,55 +50,29 @@ class Settings:
 
 
 # ---- (de)serialisation ---------------------------------------------------------------------
-def _build(cls: type, raw: Any) -> Any:
-    """Dataclass from a dict, ignoring unknown keys; None when raw is unusable."""
+def _build_profile(raw: Any) -> Profile | None:
+    """Profile from a dict, ignoring unknown keys; None when raw is unusable."""
     if not isinstance(raw, dict):
         return None
-    names = {f.name for f in dataclasses.fields(cls)}
+    names = {f.name for f in dataclasses.fields(Profile)}
     try:
-        return cls(**{k: v for k, v in raw.items() if k in names})
+        return Profile(**{k: v for k, v in raw.items() if k in names})
     except TypeError:
         return None
 
 
 def from_dict(raw: dict[str, Any]) -> Settings:
-    if "profiles" not in raw and ("start" in raw or "excluded_apps" in raw):
-        raw = _migrate_v1(raw)
+    """Version 1 and 2 files keep only the general options; their profiles, rules and
+    schedule are dropped on purpose (the profile starts from fresh defaults)."""
     s = Settings()
-    if raw.get("profiles") is not None and not isinstance(raw.get("profiles"), list):
-        raise TypeError("profiles must be a list")
-    if isinstance(raw.get("profiles"), list):
-        s.profiles = [p for p in (_build(Profile, x) for x in raw["profiles"]) if p]
-    if isinstance(raw.get("rules"), list):
-        s.rules = [r for r in (_build(Rule, x) for x in raw["rules"]) if r]
-    s.schedule = _build(Schedule, raw.get("schedule")) or Schedule()
-    for key in (
-        "monitors",
-        "monitor_profiles",
-        "interval_ms",
-        "hotkey",
-        "start_paused",
-        "close_to_tray",
-        "start_minimized",
-    ):
+    if raw.get("version") == VERSION and "profile" in raw:
+        if not isinstance(raw["profile"], dict):
+            raise TypeError("profile must be an object")
+        s.profile = _build_profile(raw["profile"]) or Profile()
+    for key in GENERAL_KEYS:
         if key in raw:
             setattr(s, key, raw[key])
     return s.normalized()
-
-
-def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
-    """Version 1 had one flat set of values plus a list of excluded apps."""
-    profiles = [asdict(p) for p in default_profiles()]
-    for key in ("start", "full", "max_opacity", "attack", "release"):
-        if key in raw:
-            profiles[0][key] = raw[key]  # "Tag" keeps the values the user had tuned
-    rules = [asdict(r) for r in default_rules()]
-    for exe in raw.get("excluded_apps") or []:
-        if isinstance(exe, str):
-            rules.append({"exe": exe, "profile": OFF_PROFILE})
-    out = {k: v for k, v in raw.items() if k not in ("start", "full", "max_opacity", "attack", "release")}
-    out.update(profiles=profiles, rules=rules)
-    return out
 
 
 def load(path: Path | None = None) -> Settings:

@@ -1,4 +1,4 @@
-"""Adaptive Screen Dimmer – start script (also the PyInstaller entry point)."""
+"""Adaptive Screen Dimmer start script (also the PyInstaller entry point)."""
 
 from dimmer.app import run
 

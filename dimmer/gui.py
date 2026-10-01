@@ -1,78 +1,54 @@
-"""Tk user interface. Runs on the main thread and talks to the engine only via its API."""
+"""Web user interface (pywebview with the Edge WebView2 runtime).
+
+pywebview owns the main thread. The page in dimmer/web talks to Python only through ``Api``;
+its methods run on pywebview worker threads, so every change of the settings goes through a lock.
+"""
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import functools
 import logging
 import queue
-import re
+import sys
+import threading
 import time
-import tkinter as tk
-from collections.abc import Callable
-from tkinter import messagebox, simpledialog, ttk
+from pathlib import Path
+from typing import Any
 
 from . import settings as settings_mod
 from .engine import Engine, Status, wanted_devices
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS
-from .profiles import (
-    AUTO,
-    GLARE_LABELS,
-    INHERIT,
-    KELVIN_MAX,
-    KELVIN_MIN,
-    OFF,
-    OWN,
-    TINT_MAX,
-    Profile,
-    Rule,
-    kelvin_to_rgb,
-    parse_hhmm,
-    schedule_phase,
-)
+from .profiles import KELVIN_MAX, KELVIN_MIN, TINT_MAX, Profile, kelvin_to_rgb, tint_active_now
 from .settings import Settings
 from .tray import TrayIcon
-from .winapi import Monitor
 
 log = logging.getLogger("dimmer")
 
-BG = "#1f2126"
-PANEL = "#2a2d34"
-FG = "#e8e8ea"
-MUTED = "#9aa0aa"
-ACCENT = "#e0a030"
-OK = "#5cc27a"
-WARN = "#e0a030"
-ERR = "#e05d5d"
-FONT = ("Segoe UI", 10)
-FONT_SMALL = ("Segoe UI", 9)
-FONT_TITLE = ("Segoe UI Semibold", 13)
-LOG_LINES = 300
-POLL_MS = 200  # 5 updates per second are plenty for meters and labels
-POLL_HIDDEN_MS = 1000  # window hidden: only tray actions and tooltip
-SAVE_DELAY_MS = 600
+TITLE = "Adaptive Screen Dimmer"
+SAVE_DELAY_S = 0.6
 STALL_S = 3.0
+TRAY_POLL_S = 0.1
+LOG_BATCH = 200
 # Measurements per second while something moves; still screens are measured at half the rate.
-RATE_PRESETS = {"Sparsam (10/s)": 100, "Normal (20/s)": 50, "Schnell (30/s)": 33}
-AUTO_LABEL = "Automatisch (Tag/Nacht)"
-TIME_RE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
-MODE_LABELS = {OWN: "eigene Werte", INHERIT: "vom Grundprofil übernehmen", OFF: "aus"}
+RATE_PRESETS = {"Sparsam": 100, "Normal": 50, "Schnell": 33}
+GLARE_NAMES = ["Aus", "Normal", "Stark", "Lokal"]
+PROFILE_FIELDS = {f.name for f in dataclasses.fields(Profile)}
+
+
+def web_dir() -> Path:
+    """Folder with index.html; inside the onefile EXE it is unpacked to sys._MEIPASS."""
+    base = getattr(sys, "_MEIPASS", None)
+    return Path(base) / "dimmer" / "web" if base else Path(__file__).with_name("web")
 
 
 def rate_name(interval_ms: int) -> str:
     return min(RATE_PRESETS, key=lambda name: abs(RATE_PRESETS[name] - interval_ms))
 
 
-def _set_text(widget: tk.Misc, text: str, **options: str) -> None:
-    """Configure a widget only when something changed (Tk redraws on every config call)."""
-    current = {"text": str(widget.cget("text")), **{k: str(widget.cget(k)) for k in options}}
-    wanted = {"text": text, **options}
-    if current != wanted:
-        widget.configure(**wanted)
-
-
 class QueueLogHandler(logging.Handler):
-    """Collects log records from any thread; the GUI drains the queue on its own thread."""
+    """Collects log records from any thread; the page fetches them while it is visible."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -85,918 +61,340 @@ class QueueLogHandler(logging.Handler):
         except queue.Full:
             pass
 
-
-class Meter(tk.Canvas):
-    """Brightness bar with markers where dimming starts and reaches full strength."""
-
-    W, H = 150, 12
-
-    def __init__(self, parent: tk.Misc) -> None:
-        super().__init__(parent, width=self.W, height=self.H, bg=BG, highlightthickness=0)
-        self.create_rectangle(0, 0, self.W, self.H, fill="#15171b", outline="")
-        self.bar = self.create_rectangle(0, 0, 0, self.H, fill="#c9c9c9", outline="")
-        self.start = self.create_line(0, 0, 0, self.H, fill=ACCENT, width=2)
-        self.full = self.create_line(0, 0, 0, self.H, fill=ERR, width=2)
-
-    _last: tuple[int, int, int] | None = None
-
-    def show(self, level: float, start: float | None, full: float | None) -> None:
-        def x(v: float) -> float:
-            return max(0.0, min(1.0, v / 255.0)) * self.W
-
-        def px(v: float | None) -> int:
-            return -5 if v is None else round(x(v))
-
-        state = (px(level), px(start), px(full))
-        if state == self._last:  # redraw only when a pixel actually moves
-            return
-        self._last = state
-
-        self.coords(self.bar, 0, 0, x(level), self.H)
-        for item, value in ((self.start, start), (self.full, full)):
-            if value is None:
-                self.coords(item, -5, 0, -5, self.H)
-            else:
-                self.coords(item, x(value), 0, x(value), self.H)
+    def drain(self, limit: int = LOG_BATCH) -> list[str]:
+        lines: list[str] = []
+        while len(lines) < limit:
+            try:
+                lines.append(self.records.get_nowait())
+            except queue.Empty:
+                break
+        return lines
 
 
-class _MonitorRow:
-    def __init__(self, var: tk.BooleanVar, base: ttk.Combobox, meter: Meter, info: ttk.Label) -> None:
-        self.var, self.base, self.meter, self.info = var, base, meter, info
+def _hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 
-class DimmerApp:
-    def __init__(
-        self,
-        root: tk.Tk,
-        engine: Engine,
-        settings: Settings,
-        log_handler: QueueLogHandler,
-        tray: TrayIcon | None = None,
-    ) -> None:
-        self.root = root
-        self.tray = tray
-        self.engine = engine
-        self.settings = settings.normalized()
-        self.log_handler = log_handler
-        self._save_job: str | None = None
-        self._monitor_rows: dict[str, _MonitorRow] = {}
-        self._monitor_key: list[Monitor] = []
-        self._loading = False
-        self._editing = self.settings.profiles[0].name
-        self._recent_apps: list[str] = []
+class Api:
+    """Bridge for the page (window.pywebview.api). Public methods are callable from JavaScript."""
 
-        root.title("Adaptive Screen Dimmer")
-        root.configure(bg=BG)
-        root.minsize(520, 560)
-        self._style()
-        self._build()
-        self._load_all()
-        root.after(POLL_MS, self._poll)
+    def __init__(self, engine: Engine, settings: Settings, log_handler: QueueLogHandler) -> None:
+        self._engine = engine
+        self._settings = settings
+        self._log = log_handler
+        self._lock = threading.Lock()
+        self._save_timer: threading.Timer | None = None
+        self._ui: DimmerApp | None = None
 
-    # ---- style / helpers ---------------------------------------------------------------
-    def _style(self) -> None:
-        st = ttk.Style(self.root)
-        st.theme_use("clam")
-        st.configure(".", background=BG, foreground=FG, font=FONT)
-        st.configure("TFrame", background=BG)
-        st.configure("Card.TLabelframe", background=BG, bordercolor="#3a3e47", relief="solid")
-        st.configure("Card.TLabelframe.Label", background=BG, foreground=MUTED, font=FONT_SMALL)
-        st.configure("TLabel", background=BG, foreground=FG)
-        st.configure("Muted.TLabel", foreground=MUTED, font=FONT_SMALL)
-        st.configure("TCheckbutton", background=BG, foreground=FG)
-        st.map("TCheckbutton", background=[("active", BG)])
-        st.configure("TRadiobutton", background=BG, foreground=FG)
-        st.map("TRadiobutton", background=[("active", BG)])
-        st.configure("Horizontal.TScale", background=BG, troughcolor="#15171b")
-        st.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=FG)
-        st.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", FG)])
-        self.root.option_add("*TCombobox*Listbox.background", PANEL)
-        self.root.option_add("*TCombobox*Listbox.foreground", FG)
-        st.configure("TButton", background=PANEL, foreground=FG, bordercolor="#3a3e47", padding=(10, 4))
-        st.map("TButton", background=[("active", "#353943")])
-        st.configure("Big.TButton", font=("Segoe UI Semibold", 11), padding=(12, 8))
-        st.configure("TNotebook", background=BG, borderwidth=0)
-        st.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, padding=(12, 5))
-        st.map("TNotebook.Tab", background=[("selected", BG)], foreground=[("selected", FG)])
-        st.configure("TEntry", fieldbackground=PANEL, foreground=FG, insertcolor=FG)
-        st.configure("TSpinbox", fieldbackground=PANEL, foreground=FG, arrowcolor=FG)
-        st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG, borderwidth=0)
-        st.configure("Treeview.Heading", background=BG, foreground=MUTED)
+    # ---- settings ------------------------------------------------------------------------------
+    def current_settings(self) -> Settings:
+        return self._settings
 
-    def _card(self, parent: tk.Misc, title: str) -> ttk.Labelframe:
-        card = ttk.Labelframe(parent, text=f" {title} ", style="Card.TLabelframe", padding=(10, 6))
-        card.pack(fill=tk.X, padx=12, pady=(0, 10))
-        return card
-
-    def _slider(
-        self,
-        parent: tk.Misc,
-        row: int,
-        text: str,
-        var: tk.IntVar,
-        lo: int,
-        hi: int,
-        fmt: Callable[[int], str],
-        on_change: Callable[[], None],
-    ) -> ttk.Scale:
-        ttk.Label(parent, text=text).grid(row=row, column=0, sticky="w", pady=2)
-        value = ttk.Label(parent, width=7, anchor="e")
-        value.grid(row=row, column=2, sticky="e")
-
-        def moved(raw: str) -> None:
-            v = int(round(float(raw)))
-            if v != var.get():
-                var.set(v)
-                on_change()
-
-        def var_written(*_: object) -> None:
-            value.config(text=fmt(var.get()))
-            if abs(float(scale.get()) - var.get()) >= 0.5:
-                scale.set(var.get())
-
-        scale = ttk.Scale(parent, from_=lo, to=hi, orient=tk.HORIZONTAL, command=moved)
-        scale.grid(row=row, column=1, sticky="we", padx=8)
-        var.trace_add("write", var_written)
-        return scale
-
-    def _combo(self, parent: tk.Misc, var: tk.StringVar, values: list[str], width: int, cmd: Callable[[], None]):
-        box = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
-        box.bind("<<ComboboxSelected>>", lambda _e: cmd())
-        return box
-
-    def _profile_names(self, with_off: bool = True) -> list[str]:
-        return [p.name for p in self.settings.profiles if with_off or not p.builtin]
-
-    # ---- layout ----------------------------------------------------------------------
-    def _build(self) -> None:
-        top = ttk.Frame(self.root, padding=(12, 12, 12, 8))
-        top.pack(fill=tk.X)
-        ttk.Label(top, text="Adaptive Screen Dimmer", font=FONT_TITLE).pack(side=tk.LEFT)
-        self.state_label = tk.Label(top, text="…", bg=BG, fg=MUTED, font=FONT_SMALL)
-        self.state_label.pack(side=tk.RIGHT)
-
-        bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        bar.pack(fill=tk.X)
-        self.pause_btn = ttk.Button(bar, style="Big.TButton", command=self.engine.toggle_paused)
-        self.pause_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.hotkey_hint = ttk.Label(bar, text="Strg+Alt+D", style="Muted.TLabel")
-        self.hotkey_hint.pack(side=tk.LEFT, padx=(10, 0))
-
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        self.notebook = nb
-        for title, builder in (
-            ("Übersicht", self._build_overview),
-            ("Profile", self._build_profiles),
-            ("Programme", self._build_rules),
-            ("Zeitplan", self._build_schedule),
-            ("Optionen", self._build_options),
-        ):
-            page = ttk.Frame(nb, padding=(0, 10, 0, 0))
-            nb.add(page, text=title)
-            builder(page)
-
-    def _build_overview(self, page: ttk.Frame) -> None:
-        card = self._card(page, "Bildschirme")
-        self.monitor_frame = ttk.Frame(card)
-        self.monitor_frame.pack(fill=tk.X)
-        row = ttk.Frame(card)
-        row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(row, text="Bildschirme kennzeichnen", command=self._identify).pack(side=tk.LEFT)
-        ttk.Label(
-            page,
-            text=(
-                "Grundprofil: gilt auf dem Bildschirm, solange dort kein Programm mit Regel vorne liegt.\n"
-                "„Automatisch“ wechselt nach dem Zeitplan zwischen Tag und Nacht.\n"
-                "Balken: aktuelle Helligkeit · gelb: Beginn · rot: volle Stärke"
-            ),
-            style="Muted.TLabel",
-            justify=tk.LEFT,
-        ).pack(anchor="w", padx=14)
-
-    def _build_profiles(self, page: ttk.Frame) -> None:
-        body = ttk.Frame(page, padding=(12, 0, 12, 0))
-        body.pack(fill=tk.BOTH, expand=True)
-        left = ttk.Frame(body)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        self.profile_list = tk.Listbox(
-            left,
-            width=16,
-            height=10,
-            bg=PANEL,
-            fg=FG,
-            selectbackground="#3d5a80",
-            highlightthickness=0,
-            borderwidth=0,
-            activestyle="none",
-            exportselection=False,
-        )
-        self.profile_list.pack(fill=tk.Y, expand=True)
-        self.profile_list.bind("<<ListboxSelect>>", lambda _e: self._select_profile())
-        for text, cmd in (
-            ("Neu", self._new_profile),
-            ("Kopieren", self._copy_profile),
-            ("Umbenennen", self._rename_profile),
-            ("Löschen", self._delete_profile),
-        ):
-            ttk.Button(left, text=text, command=cmd).pack(fill=tk.X, pady=(4, 0))
-
-        right = ttk.Frame(body)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.p_title = ttk.Label(right, font=("Segoe UI Semibold", 11))
-        self.p_title.pack(anchor="w", pady=(0, 6))
-
-        dim = ttk.Labelframe(right, text=" Abdunkelung ", style="Card.TLabelframe", padding=(10, 6))
-        dim.pack(fill=tk.X, pady=(0, 8))
-        dim.columnconfigure(1, weight=1)
-        self.p_dim_mode = tk.StringVar()
-        modes = ttk.Frame(dim)
-        modes.grid(row=0, column=0, columnspan=3, sticky="w")
-        self._mode_buttons: list[ttk.Radiobutton] = []
-        for mode in (OWN, INHERIT, OFF):
-            b = ttk.Radiobutton(
-                modes, text=MODE_LABELS[mode], value=mode, variable=self.p_dim_mode, command=self._profile_changed
-            )
-            b.pack(side=tk.LEFT, padx=(0, 8))
-            self._mode_buttons.append(b)
-        self.p_start, self.p_full, self.p_max = tk.IntVar(), tk.IntVar(), tk.IntVar()
-        self._dim_widgets = [
-            self._slider(dim, 1, "Beginnt ab Helligkeit", self.p_start, 0, 250, str, self._profile_changed),
-            self._slider(dim, 2, "Volle Stärke ab", self.p_full, 1, 255, str, self._profile_changed),
-            self._slider(dim, 3, "Stärkste Abdunkelung", self.p_max, 0, 94, lambda v: f"{v} %", self._profile_changed),
-        ]
-        self.p_attack, self.p_release = tk.StringVar(), tk.StringVar()
-        ttk.Label(dim, text="Abdunkeln").grid(row=4, column=0, sticky="w", pady=2)
-        a = self._combo(dim, self.p_attack, list(ATTACK_PRESETS), 10, self._profile_changed)
-        a.grid(row=4, column=1, sticky="w", padx=8)
-        ttk.Label(dim, text="Wieder aufhellen").grid(row=5, column=0, sticky="w", pady=2)
-        r = self._combo(dim, self.p_release, list(RELEASE_PRESETS), 10, self._profile_changed)
-        r.grid(row=5, column=1, sticky="w", padx=8)
-        self.p_glare = tk.StringVar()
-        ttk.Label(dim, text="Helle Flecken").grid(row=6, column=0, sticky="w", pady=2)
-        g = self._combo(dim, self.p_glare, list(GLARE_LABELS), 10, self._profile_changed)
-        g.grid(row=6, column=1, sticky="w", padx=8)
-        self.p_protected = tk.IntVar()
-        prot = self._slider(
-            dim,
-            7,
-            "Geschütztes Video",
-            self.p_protected,
-            0,
-            60,
-            lambda v: "aus" if v == 0 else f"{v} %",
-            self._profile_changed,
-        )
-        self._dim_widgets += [a, r, g, prot]
-        ttk.Label(
-            dim,
-            text="Helle Flecken: dunkelt auch ab, wenn nur ein kleiner Bereich grell ist (z. B. Taschenlampe\n"
-            "im dunklen Film). Geschütztes Video (Netflix & Co. im Browser) ist für Bildschirmaufnahmen\n"
-            "schwarz – dort gilt dieser feste Wert, weil die Helligkeit nicht messbar ist.",
-            style="Muted.TLabel",
-            justify=tk.LEFT,
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        tint = ttk.Labelframe(right, text=" Blaulichtfilter ", style="Card.TLabelframe", padding=(10, 6))
-        tint.pack(fill=tk.X, pady=(0, 8))
-        tint.columnconfigure(1, weight=1)
-        self.p_tint_mode = tk.StringVar()
-        modes = ttk.Frame(tint)
-        modes.grid(row=0, column=0, columnspan=3, sticky="w")
-        for mode in (OWN, INHERIT, OFF):
-            b = ttk.Radiobutton(
-                modes, text=MODE_LABELS[mode], value=mode, variable=self.p_tint_mode, command=self._profile_changed
-            )
-            b.pack(side=tk.LEFT, padx=(0, 8))
-            self._mode_buttons.append(b)
-        self.p_kelvin, self.p_strength = tk.IntVar(), tk.IntVar()
-        self._tint_widgets = [
-            self._slider(
-                tint,
-                1,
-                "Farbtemperatur",
-                self.p_kelvin,
-                KELVIN_MIN,
-                KELVIN_MAX,
-                lambda v: f"{round(v / 50) * 50} K",
-                self._profile_changed,
-            ),
-            self._slider(tint, 2, "Stärke", self.p_strength, 0, TINT_MAX, lambda v: f"{v} %", self._profile_changed),
-        ]
-        self.swatch = tk.Canvas(tint, width=46, height=14, highlightthickness=0, bg=BG)
-        self.swatch.grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(tint, text="niedrige Kelvin = wärmer, weniger Blau", style="Muted.TLabel").grid(
-            row=3, column=1, columnspan=2, sticky="w", pady=(4, 0)
-        )
-        ttk.Label(
-            right,
-            text="„Übernehmen“: Werte kommen vom Grundprofil des Bildschirms (z. B. Nacht).\n"
-            "So entstehen Mischungen wie „Zocken + Nacht“.",
-            style="Muted.TLabel",
-            justify=tk.LEFT,
-        ).pack(anchor="w")
-
-    def _build_rules(self, page: ttk.Frame) -> None:
-        body = ttk.Frame(page, padding=(12, 0, 12, 0))
-        body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(
-            body,
-            text="Liegt ein Programm auf einem Bildschirm vorne, gilt dort sein Profil –\n"
-            "nur auf diesem Bildschirm. „Aus“ = dort nie abdunkeln.\n"
-            "Mit Fenstertitel (z. B. „YouTube“) gilt die Regel in jedem Browser, solange so ein Tab vorne ist.",
-            style="Muted.TLabel",
-            justify=tk.LEFT,
-        ).pack(anchor="w", pady=(0, 6))
-        self.rule_tree = ttk.Treeview(body, columns=("exe", "title", "profile"), show="headings", height=8)
-        self.rule_tree.heading("exe", text="Programm")
-        self.rule_tree.heading("title", text="Fenstertitel enthält")
-        self.rule_tree.heading("profile", text="Profil")
-        self.rule_tree.column("exe", width=180)
-        self.rule_tree.column("title", width=160)
-        self.rule_tree.column("profile", width=160)
-        self.rule_tree.pack(fill=tk.BOTH, expand=True)
-        self.rule_tree.bind("<<TreeviewSelect>>", lambda _e: self._rule_selected())
-        form = ttk.Frame(body)
-        form.pack(fill=tk.X, pady=(8, 0))
-        self.r_exe, self.r_profile, self.r_title = tk.StringVar(), tk.StringVar(), tk.StringVar()
-        ttk.Label(form, text="Programm").grid(row=0, column=0, sticky="w")
-        self.r_exe_box = ttk.Combobox(form, textvariable=self.r_exe, width=24)
-        self.r_exe_box.grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(form, text="Profil").grid(row=0, column=2, sticky="w")
-        self.r_profile_box = ttk.Combobox(form, textvariable=self.r_profile, state="readonly", width=14)
-        self.r_profile_box.grid(row=0, column=3, sticky="w", padx=6)
-        ttk.Label(form, text="Fenstertitel enthält").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(form, textvariable=self.r_title, width=26).grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
-        ttk.Label(form, text="(leer = egal)", style="Muted.TLabel").grid(row=1, column=2, columnspan=2, sticky="w")
-        buttons = ttk.Frame(body)
-        buttons.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(buttons, text="Hinzufügen / ändern", command=self._save_rule).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Entfernen", command=self._remove_rule).pack(side=tk.LEFT, padx=6)
-        ttk.Label(
-            body,
-            text="Die Liste „Programm“ zeigt, was zuletzt auf deinen Bildschirmen vorne lag.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(6, 0))
-
-    def _build_schedule(self, page: ttk.Frame) -> None:
-        card = self._card(page, "Tag / Nacht")
-        self.s_enabled = tk.BooleanVar()
-        ttk.Checkbutton(
-            card,
-            text="Automatisch wechseln (für Bildschirme mit Grundprofil „Automatisch“)",
-            variable=self.s_enabled,
-            command=self._schedule_changed,
-        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
-        self.s_day, self.s_night = tk.StringVar(), tk.StringVar()
-        self.s_day_at, self.s_night_at = tk.StringVar(), tk.StringVar()
-        ttk.Label(card, text="Tag-Profil").grid(row=1, column=0, sticky="w", pady=2)
-        self.s_day_box = self._combo(card, self.s_day, [], 12, self._schedule_changed)
-        self.s_day_box.grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Label(card, text="ab").grid(row=1, column=2, sticky="w")
-        ttk.Entry(card, textvariable=self.s_day_at, width=6).grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Label(card, text="Nacht-Profil").grid(row=2, column=0, sticky="w", pady=2)
-        self.s_night_box = self._combo(card, self.s_night, [], 12, self._schedule_changed)
-        self.s_night_box.grid(row=2, column=1, sticky="w", padx=6)
-        ttk.Label(card, text="ab").grid(row=2, column=2, sticky="w")
-        ttk.Entry(card, textvariable=self.s_night_at, width=6).grid(row=2, column=3, sticky="w", padx=6)
-        for var in (self.s_day_at, self.s_night_at):
-            # only complete "HH:MM" values are applied, never half-typed ones like "1:0"
-            var.trace_add("write", lambda *_: self._schedule_changed() if self._times_complete() else None)
-        fade = ttk.Frame(card)
-        fade.grid(row=3, column=0, columnspan=4, sticky="we", pady=(6, 0))
-        fade.columnconfigure(1, weight=1)
-        self.s_fade = tk.IntVar()
-        self._slider(fade, 0, "Übergang", self.s_fade, 0, 120, lambda v: f"{v} min", self._schedule_changed)
-        self.s_now = ttk.Label(page, style="Muted.TLabel")
-        self.s_now.pack(anchor="w", padx=14)
-
-    def _build_options(self, page: ttk.Frame) -> None:
-        card = self._card(page, "Allgemein")
-        card.columnconfigure(1, weight=1)
-        self.rate_var = tk.StringVar()
-        ttk.Label(card, text="Messrate").grid(row=0, column=0, sticky="w")
-        self._combo(card, self.rate_var, list(RATE_PRESETS), 15, self._options_changed).grid(
-            row=0, column=1, sticky="w", padx=8
-        )
-        self.hotkey_var = tk.BooleanVar()
-        self.start_paused_var = tk.BooleanVar()
-        self.close_to_tray_var = tk.BooleanVar()
-        self.start_minimized_var = tk.BooleanVar()
-        for i, (text, var) in enumerate(
-            (
-                ("Tastenkürzel Strg+Alt+D (Pause/Weiter)", self.hotkey_var),
-                ("Beim Programmstart pausiert", self.start_paused_var),
-                ("Schließen-Knopf blendet nur aus (läuft im Infobereich weiter)", self.close_to_tray_var),
-                ("Minimiert im Infobereich starten", self.start_minimized_var),
-            ),
-            start=1,
-        ):
-            ttk.Checkbutton(card, text=text, variable=var, command=self._options_changed).grid(
-                row=i, column=0, columnspan=2, sticky="w"
-            )
-        log_card = self._card(page, "Protokoll")
-        self.log_text = tk.Text(
-            log_card,
-            height=9,
-            bg="#15171b",
-            fg=MUTED,
-            font=("Consolas", 9),
-            borderwidth=0,
-            state=tk.DISABLED,
-            wrap=tk.WORD,
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
-    # ---- settings <-> widgets ------------------------------------------------------------
-    def _load_all(self) -> None:
-        self._loading = True
-        try:
-            s = self.settings
-            names = self._profile_names()
-            self.profile_list.delete(0, tk.END)
-            for n in names:
-                self.profile_list.insert(tk.END, n)
-            if self._editing not in names:
-                self._editing = names[0]
-            idx = names.index(self._editing)
-            self.profile_list.selection_clear(0, tk.END)
-            self.profile_list.selection_set(idx)
-            self._load_profile()
-            self.rule_tree.delete(*self.rule_tree.get_children())
-            for i, r in enumerate(s.rules):
-                self.rule_tree.insert("", tk.END, iid=str(i), values=(r.exe or "(jedes)", r.title, r.profile))
-            self.r_profile_box.config(values=names)
-            if self.r_profile.get() not in names:
-                self.r_profile.set(names[0])
-            self.s_enabled.set(s.schedule.enabled)
-            base_names = self._profile_names(with_off=False)
-            self.s_day_box.config(values=base_names)
-            self.s_night_box.config(values=base_names)
-            self.s_day.set(s.schedule.day_profile)
-            self.s_night.set(s.schedule.night_profile)
-            self.s_day_at.set(s.schedule.day_start)
-            self.s_night_at.set(s.schedule.night_start)
-            self.s_fade.set(s.schedule.fade_minutes)
-            self.rate_var.set(rate_name(s.interval_ms))
-            self.hotkey_var.set(s.hotkey)
-            self.start_paused_var.set(s.start_paused)
-            self.close_to_tray_var.set(s.close_to_tray)
-            self.start_minimized_var.set(s.start_minimized)
-            self._monitor_key = []  # rebuild monitor rows (profile names may have changed)
-        finally:
-            self._loading = False
-
-    def _load_profile(self) -> None:
-        p = self.settings.profile_map()[self._editing]
-        was = self._loading
-        self._loading = True
-        try:
-            self.p_title.config(text=p.name + ("  (fest: nie abdunkeln, kein Filter)" if p.builtin else ""))
-            self.p_dim_mode.set(p.dim_mode)
-            self.p_start.set(p.start)
-            self.p_full.set(p.full)
-            self.p_max.set(round(p.max_opacity / 255 * 100))
-            self.p_attack.set(p.attack)
-            self.p_release.set(p.release)
-            self.p_glare.set(GLARE_LABELS[p.glare])
-            self.p_protected.set(p.protected_dim)
-            self.p_tint_mode.set(p.tint_mode)
-            self.p_kelvin.set(p.tint_kelvin)
-            self.p_strength.set(p.tint_strength)
-            state = tk.DISABLED if p.builtin else tk.NORMAL
-            for b in self._mode_buttons:
-                b.config(state=state)
-            self._update_profile_widgets(p)
-        finally:
-            self._loading = was
-
-    def _update_profile_widgets(self, p: Profile) -> None:
-        dim_state = "!disabled" if p.dim_mode == OWN and not p.builtin else "disabled"
-        for w in self._dim_widgets:
-            w.state([dim_state])
-            if isinstance(w, ttk.Combobox) and dim_state == "!disabled":
-                w.state(["readonly"])
-        tint_state = "!disabled" if p.tint_mode == OWN and not p.builtin else "disabled"
-        for w in self._tint_widgets:
-            w.state([tint_state])
-        r, g, b = kelvin_to_rgb(p.tint_kelvin)
-        self.swatch.delete("all")
-        self.swatch.create_rectangle(0, 0, 46, 14, fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
-
-    def _profile_changed(self) -> None:
-        if self._loading:
-            return
-        old = self.settings.profile_map()[self._editing]
-        if old.builtin:
-            return
-        start, full = self.p_start.get(), self.p_full.get()
-        if full <= start:  # push the other slider instead of letting the dragged one jump back
-            if start != old.start:
-                full = min(255, start + 1)
-                self.p_full.set(full)
-            else:
-                start = max(0, full - 1)
-                self.p_start.set(start)
-        pct = self.p_max.get()
-        max_opacity = old.max_opacity if round(old.max_opacity / 255 * 100) == pct else round(pct / 100 * 255)
-        new = dataclasses.replace(
-            old,
-            dim_mode=self.p_dim_mode.get(),
-            start=start,
-            full=full,
-            max_opacity=max_opacity,
-            attack=self.p_attack.get(),
-            release=self.p_release.get(),
-            glare=GLARE_LABELS.index(self.p_glare.get()) if self.p_glare.get() in GLARE_LABELS else old.glare,
-            protected_dim=self.p_protected.get(),
-            tint_mode=self.p_tint_mode.get(),
-            tint_kelvin=self.p_kelvin.get(),
-            tint_strength=self.p_strength.get(),
-        ).normalized()
-        self._update_profile_widgets(new)
-        profiles = [new if p.name == old.name else p for p in self.settings.profiles]
-        self._apply(dataclasses.replace(self.settings, profiles=profiles))
-
-    def _apply(self, new: Settings, reload: bool = False) -> None:
+    def _apply(self, new: Settings) -> None:
+        """Caller holds the lock."""
         new = new.normalized()
-        if new == self.settings:
+        if new == self._settings:
             return
-        self.settings = new
-        self.engine.update_settings(new)
-        if self._save_job:
-            self.root.after_cancel(self._save_job)
-        self._save_job = self.root.after(SAVE_DELAY_MS, self._save)
-        if reload:
-            self._load_all()
+        self._settings = new
+        self._engine.update_settings(new)
+        if self._save_timer:
+            self._save_timer.cancel()
+        self._save_timer = threading.Timer(SAVE_DELAY_S, self.flush)
+        self._save_timer.daemon = True
+        self._save_timer.start()
 
-    def _save(self) -> None:
-        self._save_job = None
+    def flush(self) -> None:
+        """Writes the settings now (also called on quit so nothing pending gets lost)."""
+        with self._lock:
+            if self._save_timer:
+                self._save_timer.cancel()
+                self._save_timer = None
+            s = self._settings
         try:
-            settings_mod.save(self.settings)
+            settings_mod.save(s)
         except OSError as e:
             log.warning("Einstellungen konnten nicht gespeichert werden: %s", e)
 
-    # ---- profiles --------------------------------------------------------------------------
-    def _select_profile(self) -> None:
-        sel = self.profile_list.curselection()
-        if sel:
-            self._editing = self.profile_list.get(sel[0])
-            self._load_profile()
+    # ---- called from JavaScript ------------------------------------------------------------------
+    def get_state(self) -> dict[str, Any]:
+        """Everything the page needs once at start: settings, choices, limits."""
+        with self._lock:
+            s = self._settings
+        return {
+            "profile": dataclasses.asdict(s.profile),
+            "options": {
+                "rate": rate_name(s.interval_ms),
+                "hotkey": s.hotkey,
+                "start_paused": s.start_paused,
+                "close_to_tray": s.close_to_tray,
+                "start_minimized": s.start_minimized,
+            },
+            "choices": {
+                "attack": list(ATTACK_PRESETS),
+                "release": list(RELEASE_PRESETS),
+                "glare": GLARE_NAMES,
+                "rate": list(RATE_PRESETS),
+            },
+            "limits": {"kelvin_min": KELVIN_MIN, "kelvin_max": KELVIN_MAX, "tint_max": TINT_MAX},
+            "kelvin": {str(k): _hex(kelvin_to_rgb(k)) for k in range(KELVIN_MIN, KELVIN_MAX + 1, 100)},
+        }
 
-    def _ask_name(self, title: str, initial: str = "") -> str | None:
-        name = simpledialog.askstring(title, "Name des Profils:", initialvalue=initial, parent=self.root)
-        if name is None:
-            return None
-        name = name.strip()[:40]
-        if not name or name == AUTO:
-            return None
-        if name in self.settings.profile_map() and name != initial:
-            messagebox.showinfo("Profile", f"„{name}“ gibt es schon.", parent=self.root)
-            return None
-        return name
+    def set_profile(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Takes changed profile fields, returns the profile as it was stored (clamped)."""
+        with self._lock:
+            changes = {k: v for k, v in values.items() if k in PROFILE_FIELDS}
+            try:
+                profile = dataclasses.replace(self._settings.profile, **changes).normalized()
+            except (TypeError, ValueError) as e:
+                log.warning("Ungültige Profilwerte: %s", e)
+                profile = self._settings.profile
+            self._apply(dataclasses.replace(self._settings, profile=profile))
+            return dataclasses.asdict(self._settings.profile)
 
-    def _insert_profile(self, profile: Profile) -> None:
-        profiles = [p for p in self.settings.profiles if not p.builtin] + [profile]
-        profiles += [p for p in self.settings.profiles if p.builtin]
-        self._editing = profile.name
-        self._apply(dataclasses.replace(self.settings, profiles=profiles), reload=True)
+    def reset_profile(self) -> dict[str, Any]:
+        with self._lock:
+            self._apply(dataclasses.replace(self._settings, profile=Profile()))
+            log.info("Profil auf Standardwerte zurückgesetzt")
+            return dataclasses.asdict(self._settings.profile)
 
-    def _new_profile(self) -> None:
-        name = self._ask_name("Neues Profil")
-        if name:
-            self._insert_profile(Profile(name, tint_mode=INHERIT))
+    def set_option(self, name: str, value: Any) -> None:
+        with self._lock:
+            s = self._settings
+            if name == "rate" and value in RATE_PRESETS:
+                new = dataclasses.replace(s, interval_ms=RATE_PRESETS[value])
+            elif name in ("hotkey", "start_paused", "close_to_tray", "start_minimized"):
+                new = dataclasses.replace(s, **{name: bool(value)})  # type: ignore[arg-type]
+            else:
+                return
+            self._apply(new)
 
-    def _copy_profile(self) -> None:
-        src = self.settings.profile_map()[self._editing]
-        name = self._ask_name("Profil kopieren", f"{src.name} 2")
-        if name:
-            copy = dataclasses.replace(src, name=name)
-            if src.builtin:
-                copy = dataclasses.replace(copy, dim_mode=OWN)
-            self._insert_profile(copy)
+    def toggle_pause(self) -> bool:
+        self._engine.toggle_paused()
+        return self._engine.snapshot().paused_reason == "user"
 
-    def _rename_profile(self) -> None:
-        old = self._editing
-        if self.settings.profile_map()[old].builtin:
-            return
-        new = self._ask_name("Profil umbenennen", old)
-        if not new or new == old:
-            return
-        s = self.settings
+    def set_monitor_enabled(self, device: str, enabled: bool) -> None:
+        with self._lock:
+            monitors = self._engine.monitors()
+            present = {m.device for m in monitors}
+            chosen = set(wanted_devices(self._settings.monitors, monitors))
+            if enabled:
+                chosen.add(device)
+            else:
+                chosen.discard(device)
+            if not chosen:
+                return  # at least one monitor stays active
+            ordered = [m.device for m in monitors if m.device in chosen]
+            # Monitors that are unplugged right now (laptop on the road) keep their choice.
+            ordered += [d for d in self._settings.monitors if d not in present]
+            self._apply(dataclasses.replace(self._settings, monitors=ordered))
 
-        def ren(n: str) -> str:
-            return new if n == old else n
+    def identify(self) -> None:
+        if self._ui:
+            self._ui.identify()
 
-        self._editing = new
-        self._apply(
-            dataclasses.replace(
-                s,
-                profiles=[dataclasses.replace(p, name=ren(p.name)) for p in s.profiles],
-                rules=[Rule(r.exe, ren(r.profile), r.title) for r in s.rules],
-                schedule=dataclasses.replace(
-                    s.schedule, day_profile=ren(s.schedule.day_profile), night_profile=ren(s.schedule.night_profile)
-                ),
-                monitor_profiles={d: ren(n) for d, n in s.monitor_profiles.items()},
-            ),
-            reload=True,
-        )
-
-    def _delete_profile(self) -> None:
-        name = self._editing
-        s = self.settings
-        if s.profile_map()[name].builtin:
-            return
-        if len(self._profile_names(with_off=False)) <= 1:
-            messagebox.showinfo("Profile", "Das letzte Profil kann nicht gelöscht werden.", parent=self.root)
-            return
-        used = [
-            " + ".join(x for x in (r.exe, f"„{r.title}“" if r.title else "") if x) for r in s.rules if r.profile == name
-        ]
-        text = f"Profil „{name}“ löschen?"
-        if used:
-            text += "\nDiese Regeln werden mit entfernt: " + ", ".join(used)
-        if not messagebox.askyesno("Profile", text, parent=self.root):
-            return
-        s = self.settings  # may have changed while the dialog was open (tray)
-        if name not in s.profile_map():
-            return
-        self._apply(
-            dataclasses.replace(
-                s,
-                profiles=[p for p in s.profiles if p.name != name],
-                monitor_profiles={d: n for d, n in s.monitor_profiles.items() if n != name},
-            ),
-            reload=True,
-        )
-
-    # ---- rules -------------------------------------------------------------------------------
-    def _selected_rules(self) -> list[Rule]:
-        rules = self.settings.rules
-        return [rules[int(i)] for i in self.rule_tree.selection() if int(i) < len(rules)]
-
-    def _rule_selected(self) -> None:
-        sel = self._selected_rules()
-        if sel:
-            self.r_exe.set(sel[0].exe)
-            self.r_title.set(sel[0].title)
-            self.r_profile.set(sel[0].profile)
-
-    def _save_rule(self) -> None:
-        exe = self.r_exe.get().strip().lower()
-        title = self.r_title.get().strip()
-        prof = self.r_profile.get()
-        if not (exe or title) or prof not in self.settings.profile_map():
-            return
-        if exe and not exe.endswith(".exe"):
-            exe += ".exe"
-        rules = [r for r in self.settings.rules if (r.exe, r.title.lower()) != (exe, title.lower())]
-        self._apply(dataclasses.replace(self.settings, rules=rules + [Rule(exe, prof, title)]), reload=True)
-
-    def _remove_rule(self) -> None:
-        sel = self._selected_rules()
-        if sel:
-            rules = [r for r in self.settings.rules if r not in sel]
-            self._apply(dataclasses.replace(self.settings, rules=rules), reload=True)
-
-    # ---- schedule / options ----------------------------------------------------------------
-    def _times_complete(self) -> bool:
-        return all(TIME_RE.fullmatch(v.get().strip()) for v in (self.s_day_at, self.s_night_at))
-
-    def _schedule_changed(self) -> None:
-        if self._loading:
-            return
-        sch = self.settings.schedule
-        day_at, night_at = self.s_day_at.get().strip(), self.s_night_at.get().strip()
-        valid = self._times_complete() and parse_hhmm(day_at, -1) >= 0 and parse_hhmm(night_at, -1) >= 0
-        new = dataclasses.replace(
-            sch,
-            enabled=self.s_enabled.get(),
-            day_profile=self.s_day.get(),
-            night_profile=self.s_night.get(),
-            day_start=day_at if valid else sch.day_start,
-            night_start=night_at if valid else sch.night_start,
-            fade_minutes=self.s_fade.get(),
-        )
-        self._apply(dataclasses.replace(self.settings, schedule=new))
-
-    def _options_changed(self) -> None:
-        if self._loading:
-            return
-        self._apply(
-            dataclasses.replace(
-                self.settings,
-                interval_ms=RATE_PRESETS.get(self.rate_var.get(), self.settings.interval_ms),
-                hotkey=self.hotkey_var.get(),
-                start_paused=self.start_paused_var.get(),
-                close_to_tray=self.close_to_tray_var.get(),
-                start_minimized=self.start_minimized_var.get(),
-            )
-        )
-
-    # ---- monitors --------------------------------------------------------------------------
-    def _rebuild_monitors(self, monitors: list[Monitor], active: set[str]) -> None:
-        for child in self.monitor_frame.winfo_children():
-            child.destroy()
-        self._monitor_rows.clear()
-        choices = [AUTO_LABEL] + self._profile_names()
+    def get_status(self) -> dict[str, Any]:
+        """Live values for the page, polled several times per second while it is visible."""
+        st = self._engine.snapshot()
+        monitors = self._engine.monitors()
+        with self._lock:
+            s = self._settings
+        wanted = set(wanted_devices(s.monitors, monitors))
+        live = {m.device: m for m in st.monitors}
+        rows = []
         for i, m in enumerate(monitors):
-            box = ttk.Frame(self.monitor_frame)
-            box.pack(fill=tk.X, pady=(2, 6))
-            head = ttk.Frame(box)
-            head.pack(fill=tk.X)
-            var = tk.BooleanVar(value=m.device in active)
-            text = f"Bildschirm {i + 1}  {m.width}×{m.height}" + ("  (Haupt)" if m.primary else "")
-            ttk.Checkbutton(
-                head, text=text, variable=var, command=functools.partial(self._toggle_monitor, m.device)
-            ).pack(side=tk.LEFT)
-            base_var = tk.StringVar()
-            choice = self.settings.base_choice(m.device)
-            base_var.set(AUTO_LABEL if choice == AUTO else choice)
-            base = ttk.Combobox(head, textvariable=base_var, values=choices, state="readonly", width=22)
-            base.bind("<<ComboboxSelected>>", functools.partial(self._base_changed, m.device, base_var))
-            base.pack(side=tk.RIGHT)
-            line = ttk.Frame(box)
-            line.pack(fill=tk.X, pady=(2, 0))
-            meter = Meter(line)
-            meter.pack(side=tk.LEFT, padx=(22, 8))
-            info = ttk.Label(line, text="", style="Muted.TLabel")
-            info.pack(side=tk.LEFT)
-            self._monitor_rows[m.device] = _MonitorRow(var, base, meter, info)
+            ms = live.get(m.device)
+            rows.append(
+                {
+                    "device": m.device,
+                    "number": i + 1,
+                    "size": f"{m.width} × {m.height}",
+                    "primary": m.primary,
+                    "enabled": m.device in wanted,
+                    "active": ms is not None,
+                    "brightness": round(ms.brightness, 1) if ms else 0,
+                    "start": ms.start if ms else None,
+                    "full": ms.full if ms else None,
+                    "dim": round(ms.opacity / 255 * 100) if ms else 0,
+                    "tint": round(ms.tint) if ms else 0,
+                    "capture": ms.capture if ms else "",
+                }
+            )
+        lt = time.localtime()
+        return {
+            "state": _state(st),
+            "paused": st.paused_reason == "user",
+            "hotkey_ok": st.hotkey_ok,
+            "monitors": rows,
+            "tint_now": tint_active_now(s.profile, lt.tm_hour * 60 + lt.tm_min),
+            "log": self._log.drain(),
+        }
 
-    def _base_changed(self, device: str, var: tk.StringVar, _event: object = None) -> None:
-        value = var.get()
-        mp = dict(self.settings.monitor_profiles)
-        if value == AUTO_LABEL:
-            mp.pop(device, None)
-        else:
-            mp[device] = value
-        self._apply(dataclasses.replace(self.settings, monitor_profiles=mp))
 
-    def _toggle_monitor(self, device: str) -> None:
-        chosen = [d for d, row in self._monitor_rows.items() if row.var.get()]
-        if not chosen:
-            self._monitor_rows[device].var.set(True)  # at least one monitor stays active
-            return
-        # Monitors that are unplugged right now (laptop on the road) keep their choice.
-        chosen += [d for d in self.settings.monitors if d not in self._monitor_rows]
-        self._apply(dataclasses.replace(self.settings, monitors=chosen))
+def _state(st: Status) -> dict[str, str]:
+    stalled = st.running and st.heartbeat and time.monotonic() - st.heartbeat > STALL_S
+    if st.error:
+        return {"kind": "error", "text": f"Fehler: {st.error}"}
+    if stalled:
+        return {"kind": "error", "text": "Reagiert nicht"}
+    if not st.running:
+        return {"kind": "error", "text": "Gestoppt"}
+    if st.paused_reason == "user":
+        return {"kind": "paused", "text": "Pausiert"}
+    return {"kind": "ok", "text": "Aktiv"}
 
-    def _identify(self) -> None:
-        for i, m in enumerate(self._monitor_key):
-            win = tk.Toplevel(self.root)
-            win.overrideredirect(True)
-            win.attributes("-topmost", True)
-            win.configure(bg=ACCENT)
-            size = 160
-            win.geometry(f"{size}x{size}+{m.left + 40}+{m.top + 40}")
-            tk.Label(win, text=str(i + 1), bg=ACCENT, fg="#111", font=("Segoe UI Semibold", 72)).pack(expand=True)
-            win.after(1800, win.destroy)
 
-    # ---- window / tray -----------------------------------------------------------------------
-    def close_window(self) -> None:
-        """Window close button: hide to the tray when possible, otherwise quit."""
-        if self.tray and self.tray.is_alive() and self.settings.close_to_tray:
-            self.root.withdraw()
-        else:
-            self.quit()
+def _place(title: str, x: int, y: int) -> None:
+    """pywebview scales window positions by the DPI factor; monitor rects are physical pixels."""
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+        user32.SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+
+
+IDENTIFY_HTML = """<!doctype html><html><body style="margin:0;height:100vh;display:grid;place-items:center;
+background:#f0b45a;color:#1b1407;font:600 96px 'Segoe UI Variable Display','Segoe UI',sans-serif;
+user-select:none;cursor:default">{n}</body></html>"""
+
+
+class DimmerApp:
+    """Window, tray and engine glue. Create it, then call run() on the main thread."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        settings: Settings,
+        log_handler: QueueLogHandler,
+        tray: TrayIcon | None,
+        start_hidden: bool = False,
+    ) -> None:
+        import webview
+
+        self._webview = webview
+        self.engine = engine
+        self.tray = tray
+        self.api = Api(engine, settings, log_handler)
+        self.api._ui = self
+        self._visible = not start_hidden
+        self._quitting = False
+        self._stop = threading.Event()
+        window = webview.create_window(
+            TITLE,
+            url=str(web_dir() / "index.html"),
+            js_api=self.api,
+            width=640,
+            height=860,
+            min_size=(460, 560),
+            hidden=start_hidden,
+            background_color="#1c1c1c",
+        )
+        if window is None:
+            raise RuntimeError("window could not be created")
+        self.window = window
+        self.window.events.closing += self._on_closing
+        self.window.events.minimized += lambda: self._set_visible(False)
+        self.window.events.restored += lambda: self._set_visible(True)
+
+    # ---- window ------------------------------------------------------------------------------------
+    def run(self) -> None:
+        threading.Thread(target=self._tray_loop, name="ui-tray", daemon=True).start()
+        self._webview.start(private_mode=True, debug=False)
+        self._stop.set()
+
+    def _set_visible(self, visible: bool) -> None:
+        self._visible = visible
+        try:
+            self.window.evaluate_js(f"window.dimmerVisible && window.dimmerVisible({str(visible).lower()})")
+        except Exception:  # page not loaded yet
+            pass
+
+    def _on_closing(self) -> bool:
+        """Close button: hide to the tray when wanted, otherwise quit. False keeps the window."""
+        if self._quitting:
+            return True
+        if self.tray and self.tray.is_alive() and self.api.current_settings().close_to_tray:
+            self.hide_window()
+            return False
+        self._quitting = True
+        self.api.flush()
+        return True
 
     def show_window(self) -> None:
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
+        self.window.show()
+        self.window.restore()
+        self._set_visible(True)
+
+    def hide_window(self) -> None:
+        self.window.hide()
+        self._set_visible(False)
 
     def quit(self) -> None:
-        if self._save_job:  # write pending changes before leaving
-            self.root.after_cancel(self._save_job)
-            self._save()
-        self.engine.stop()
-        if self.tray:
-            self.tray.close()
-        self.root.destroy()
-
-    def _set_all_bases(self, choice: str) -> None:
-        connected = {m.device for m in self._monitor_key}
-        mp = {d: v for d, v in self.settings.monitor_profiles.items() if d not in connected}
-        if choice != AUTO:
-            mp.update({d: choice for d in connected})
-        self._apply(dataclasses.replace(self.settings, monitor_profiles=mp))
-        self._monitor_key = []  # refresh the comboboxes
-
-    def _handle_tray(self, st: Status) -> None:
-        if not self.tray:
+        if self._quitting:
             return
-        while True:
-            try:
-                action = self.tray.actions.get_nowait()
-            except queue.Empty:
-                break
-            if action == "toggle":
-                self.engine.toggle_paused()
-            elif action == "show":
-                if self.root.state() == "withdrawn":
-                    self.show_window()
-                else:
-                    self.root.withdraw()
-            elif action == "quit":
-                self.quit()
-                return
-            elif action.startswith("base:"):
-                self._set_all_bases(action[5:])
-        if st.paused_reason == "user":
-            tip = "Adaptive Screen Dimmer – pausiert"
-        else:
-            parts = [f"{i + 1}: {m.profile} {round(m.opacity / 255 * 100)} %" for i, m in enumerate(st.monitors)]
-            tip = "Adaptive Screen Dimmer – " + " · ".join(parts)
-        bases = set(self.settings.monitor_profiles.get(m.device, AUTO) for m in self._monitor_key) or {AUTO}
-        current = bases.pop() if len(bases) == 1 else ""
-        self.tray.set_state(bool(st.paused_reason), tip, self._profile_names(), current)
+        self._quitting = True
+        self.api.flush()
+        self.window.destroy()
 
-    # ---- log ---------------------------------------------------------------------------------
-    def _drain_log(self) -> None:
-        lines = []
-        while True:
-            try:
-                lines.append(self.log_handler.records.get_nowait())
-            except queue.Empty:
-                break
-        if not lines:
-            return
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, "\n".join(lines) + "\n")
-        extra = int(self.log_text.index("end-1c").split(".")[0]) - LOG_LINES
-        if extra > 0:
-            self.log_text.delete("1.0", f"{extra + 1}.0")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
+    def identify(self) -> None:
+        """Shows the number of each monitor in its top left corner for two seconds."""
+        windows = []
+        for i, m in enumerate(self.engine.monitors()):
+            w = self._webview.create_window(
+                f"Bildschirm {i + 1}",
+                html=IDENTIFY_HTML.format(n=i + 1),
+                x=m.left + 48,
+                y=m.top + 48,
+                width=180,
+                height=180,
+                frameless=True,
+                on_top=True,
+                focus=False,
+                resizable=False,
+                min_size=(120, 120),
+                easy_drag=False,
+                background_color="#f0b45a",
+            )
+            if w is not None:
+                windows.append(w)
+                w.events.shown += functools.partial(_place, f"Bildschirm {i + 1}", m.left + 48, m.top + 48)
 
-    # ---- polling -------------------------------------------------------------------------------
-    def _poll(self) -> None:
-        hidden = self.root.state() in ("withdrawn", "iconic")
-        try:
-            st = self.engine.snapshot()
-            if not hidden:  # nothing to draw while the window is not shown
-                self._refresh(st)
-                self._drain_log()
-            self._handle_tray(st)
-        finally:
-            self.root.after(POLL_HIDDEN_MS if hidden else POLL_MS, self._poll)
+        def close() -> None:
+            for w in windows:
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
 
-    def _refresh(self, st: Status) -> None:
-        monitors = self.engine.monitors()
-        wanted = set(wanted_devices(self.settings.monitors, monitors))
-        if monitors != self._monitor_key:
-            self._monitor_key = monitors
-            self._rebuild_monitors(monitors, wanted)
-        rows = {m.device: m for m in st.monitors}
-        for device, row in self._monitor_rows.items():
-            if row.var.get() != (device in wanted):
-                row.var.set(device in wanted)
-            m = rows.get(device)
-            if m is None:
-                row.meter.show(0.0, None, None)
-                _set_text(row.info, "nicht aktiv")
+        threading.Timer(2.0, close).start()
+
+    # ---- tray -----------------------------------------------------------------------------------------
+    def _tray_loop(self) -> None:
+        last_tip = None
+        while not self._stop.wait(TRAY_POLL_S):
+            if not self.tray:
                 continue
-            row.meter.show(m.brightness, m.start, m.full)
-            parts = [m.profile or "–", m.capture]
-            if m.app:
-                parts.append(m.app)
-            parts.append(f"{round(m.opacity / 255 * 100)} %")
-            if m.protected:
-                parts.append("Bild nicht messbar (geschützt?)")
-            if m.tint >= 0.5:
-                parts.append(f"Filter {round(m.tint)} %")
-            _set_text(row.info, "  ·  ".join(parts))
-
-        stalled = st.running and st.heartbeat and time.monotonic() - st.heartbeat > STALL_S
-        if st.error:
-            text, color = f"Fehler: {st.error}", ERR
-        elif stalled:
-            text, color = "Reagiert nicht", ERR
-        elif not st.running:
-            text, color = "Gestoppt", ERR
-        elif st.paused_reason == "user":
-            text, color = "Pausiert", WARN
-        else:
-            text, color = "Aktiv", OK
-        _set_text(self.state_label, f"● {text}", fg=color)
-        _set_text(self.pause_btn, "▶  Fortsetzen" if st.paused_reason == "user" else "⏸  Pausieren")
-        _set_text(self.hotkey_hint, "Strg+Alt+D" if st.hotkey_ok else "")
-
-        if st.recent_apps != self._recent_apps:
-            self._recent_apps = list(st.recent_apps)
-            self.r_exe_box.config(values=self._recent_apps)
-        self._refresh_schedule_hint()
-
-    def _refresh_schedule_hint(self) -> None:
-        sch = self.settings.schedule
-        if not sch.enabled:
-            _set_text(self.s_now, "Zeitplan aus: „Automatisch“ nutzt das Tag-Profil.")
-            return
-        lt = time.localtime()
-        a, b, t = schedule_phase(sch, lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60)
-        if a == b:
-            nxt = sch.night_start if a == sch.day_profile else sch.day_start
-            _set_text(self.s_now, f"Jetzt: {a}  ·  nächster Wechsel um {nxt}")
-        else:
-            _set_text(self.s_now, f"Jetzt: Übergang {a} → {b} ({round(t * 100)} %)")
+            try:
+                while True:
+                    action = self.tray.actions.get_nowait()
+                    if action == "toggle":
+                        self.engine.toggle_paused()
+                    elif action == "show":
+                        if self._visible:
+                            self.hide_window()
+                        else:
+                            self.show_window()
+                    elif action == "quit":
+                        self.quit()
+                        return
+            except queue.Empty:
+                pass
+            st = self.engine.snapshot()
+            paused = st.paused_reason == "user"
+            if paused:
+                tip = f"{TITLE}: pausiert"
+            else:
+                parts = [f"{i + 1}: {round(m.opacity / 255 * 100)} %" for i, m in enumerate(st.monitors)]
+                tip = f"{TITLE}: " + ", ".join(parts)
+            if (paused, tip) != last_tip:
+                last_tip = (paused, tip)
+                self.tray.set_state(paused, tip)

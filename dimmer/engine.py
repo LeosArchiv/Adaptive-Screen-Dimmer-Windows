@@ -13,7 +13,6 @@ import math
 import queue
 import threading
 import time
-from collections import deque
 from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -41,9 +40,9 @@ from .logic import (
     tile_sums,
 )
 from .overlay import Overlay
-from .profiles import GLARE_WEIGHTS, Effective, kelvin_to_rgb, resolve_monitor
+from .profiles import GLARE_WEIGHTS, Effective, kelvin_to_rgb, resolve
 from .settings import Settings
-from .winapi import Monitor, Sampler, clear_monitor_id_cache, list_monitors, user32, windows_per_monitor
+from .winapi import Monitor, Sampler, clear_monitor_id_cache, list_monitors, user32
 
 log = logging.getLogger("dimmer")
 
@@ -122,21 +121,16 @@ TINT_RATE = 25.0  # percent per second: profile changes blend the tint in ~1 s
 KELVIN_RATE = 3000.0  # kelvin per second
 MONITOR_CHECK_S = 3.0
 TOPMOST_REFRESH_S = 1.0
-PROFILE_CHECK_S = 0.25  # which app is in front on which monitor
+PROFILE_CHECK_S = 0.25  # profile and night window are re-evaluated this often
 FINGERPRINT_STEP = 8
 LOCAL_REDRAW_S = 0.033
 LOCAL_FREE_AFTER_S = 30.0
-BLIND_SHARE = 0.9  # share of exactly black tiles that means "cannot see the picture"
-BLIND_AFTER_S = 1.5  # ... held this long (a cut to black in a film is shorter)
-BLIND_LEAVE_SHARE = 0.6
-BLIND_LEAVE_S = 1.0
 BURST_DELTA = 8.0  # brightness change (0..255) between two measurements that starts a burst
 WGC_WATCHDOG_S = 15.0  # GPU capture without any frame this long: restart it (it may be dead)
 WM_POWERBROADCAST = 0x0218
 WGC_RETRY_S = 30.0  # a monitor that fell back to GDI tries GPU capture again after this
 STATUS_REFRESH_S = 0.25
 WGC_MIN_INTERVAL_S = 0.016  # GPU capture: polling is nearly free, so poll up to ~60x per second
-APP_CONFIRM = 2  # consecutive sightings before a monitor switches to another app's profile
 IDLE_AFTER_S = 2.0  # screen unchanged this long -> slower measuring
 IDLE_FACTOR = 2.0  # at most 100 ms extra latency for a flash after a still phase
 IDLE_INTERVAL_MAX_S = 0.25  # while paused
@@ -155,15 +149,11 @@ class MonitorStatus:
     target: float = 0.0
     opacity: int = 0
     excluded_from_capture: bool = True
-    profile: str = ""  # e.g. "Zocken + Nacht"
-    reason: str = ""  # e.g. "Programm ddnet.exe", "Zeitplan"
-    app: str | None = None  # app in front on this monitor
     tint: float = 0.0  # current blue-light filter strength in percent
     start: float | None = None  # thresholds in effect (None: dimming off), for the meter
     full: float | None = None
     spot: float = 0.0  # brightest 128 px block
     capture: str = ""  # "GPU" (Windows.Graphics.Capture) or "GDI" (fallback)
-    protected: bool = False  # picture unmeasurable (exactly black), probably protected video
 
 
 @dataclass
@@ -171,7 +161,6 @@ class Status:
     running: bool = False
     paused: bool = False
     paused_reason: str = ""  # "" or "user"
-    recent_apps: list[str] = field(default_factory=list)  # newest first, for rule suggestions
     monitors: list[MonitorStatus] = field(default_factory=list)
     error: str | None = None
     hotkey_ok: bool = False
@@ -219,8 +208,6 @@ class _Slot:
         self.mask_target: np.ndarray | None = None  # what the current picture asks for
         self._mask_moving = False
         self._mask_shown_at = 0.0
-        self.black_since: float | None = None  # picture exactly black (protected video?) since
-        self.unblack_since: float | None = None
         # One capture buffer per monitor: a shared one would be reallocated every round when
         # monitors differ in size. A fresh screen DC also follows display mode changes.
         self.sampler = Sampler()
@@ -241,12 +228,6 @@ class _Slot:
         self._fingerprint: np.ndarray | None = None
         self._fingerprint_spot = False
         self.effective = Effective()
-        self.app: tuple[str | None, str] | str | None = None  # confirmed window in front
-        self.front_exe: str | None = None
-        self.front_title = ""
-        self.app_known = False
-        self.pending_app: tuple[str | None, str] | str | None = None
-        self.pending_hits = 0
         self.tint_strength = 0.0  # current, fades toward effective.tint_strength
         self.tint_kelvin = 3400.0
         self.gamma = GammaTint(monitor.gdi_name)  # preferred: warm white without a coloured veil
@@ -275,7 +256,7 @@ class _Slot:
             self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
             # warn once; later retries of the same problem go to the debug log only
             (log.debug if quiet or self.wgc_failures > 1 else log.warning)(
-                "%s: GPU-Aufnahme nicht möglich (%s) – GDI wird genutzt", self.monitor.gdi_name, e
+                "%s: GPU-Aufnahme nicht möglich (%s), GDI wird genutzt", self.monitor.gdi_name, e
             )
 
     def stop_gpu_capture(self) -> None:
@@ -302,7 +283,7 @@ class _Slot:
                 if self.capture.submissions != submitted:
                     self.processed_at = now  # the measuring slot starts with the submission
             except Exception as e:
-                log.warning("%s: GPU-Aufnahme fehlgeschlagen (%s) – wechsle zu GDI", self.monitor.gdi_name, e)
+                log.warning("%s: GPU-Aufnahme fehlgeschlagen (%s), wechsle zu GDI", self.monitor.gdi_name, e)
                 self.stop_gpu_capture()
                 self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
             else:
@@ -337,34 +318,6 @@ class _Slot:
 
     def forget_frame(self) -> None:
         self._fingerprint = None
-
-    # ---- protected (unmeasurable) content ----------------------------------------------------
-    def track_black(self, stats: FrameStats) -> None:
-        """Enter 'unmeasurable' after >= 90 % exact black for 1.5 s; leave it only when clearly
-        less is black (< 60 %) for 1 s, so player controls fading in and out do not pump."""
-        now = time.monotonic()
-        if stats.black_share >= BLIND_SHARE:
-            self.unblack_since = None
-            if self.black_since is None:
-                self.black_since = now
-        elif self.blind and stats.black_share >= BLIND_LEAVE_SHARE:
-            self.unblack_since = None  # still mostly black: stay
-        elif self.blind:
-            if self.unblack_since is None:
-                self.unblack_since = now
-            elif now - self.unblack_since >= BLIND_LEAVE_S:
-                self.black_since = self.unblack_since = None
-        else:
-            self.black_since = None
-
-    @property
-    def blind(self) -> bool:
-        """Picture has been exactly black for a while: most likely protected video."""
-        return self.black_since is not None and time.monotonic() - self.black_since >= BLIND_AFTER_S
-
-    def blind_pending(self) -> bool:
-        """Entering or leaving 'protected' is still ahead: keep ticking even without frames."""
-        return (self.black_since is not None and not self.blind) or self.unblack_since is not None
 
     @property
     def dim(self) -> Overlay:
@@ -503,7 +456,7 @@ class _Slot:
         if layer.visible:
             self.local_hidden_at = None
             if not layer.alive():
-                log.info("%s: Composition-Gerät verloren – lokale Ebene wird neu aufgebaut", self.monitor.gdi_name)
+                log.info("%s: Composition-Gerät verloren, lokale Ebene wird neu aufgebaut", self.monitor.gdi_name)
                 self.stop_local()
         elif self.local_hidden_at is None:
             self.local_hidden_at = time.monotonic()
@@ -584,7 +537,6 @@ class Engine(threading.Thread):
         self._slots: dict[str, _Slot] = {}
         self._monitors: list[Monitor] = []
         self._paused = settings.start_paused
-        self._recent_apps: deque[str] = deque(maxlen=12)
         self._wake_now = False
         self._monitors_dirty = True  # first loop round enumerates the monitors
         self._force_refresh = False
@@ -625,7 +577,6 @@ class Engine(threading.Thread):
                 running=s.running,
                 paused=s.paused,
                 paused_reason=s.paused_reason,
-                recent_apps=list(s.recent_apps),
                 monitors=[MonitorStatus(**vars(m)) for m in s.monitors],
                 error=s.error,
                 hotkey_ok=s.hotkey_ok,
@@ -779,12 +730,12 @@ class Engine(threading.Thread):
             self._gpu = _GpuContext()
         except Exception as e:
             self._gpu = None
-            log.warning("GPU-Aufnahme nicht verfügbar (%s) – GDI wird genutzt", e)
+            log.warning("GPU-Aufnahme nicht verfügbar (%s), GDI wird genutzt", e)
 
     def _retry_gpu_captures(self) -> None:
         """Rebuild a lost GPU device, restart dead or stale captures, retry fallen-back monitors."""
         if self._gpu is not None and self._gpu.gpu.is_lost():
-            log.warning("Grafikkarte zurückgesetzt – GPU-Aufnahme wird neu aufgebaut")
+            log.warning("Grafikkarte zurückgesetzt, GPU-Aufnahme wird neu aufgebaut")
             self._restart_gpu()
             return
         now = time.monotonic()
@@ -862,7 +813,7 @@ class Engine(threading.Thread):
                 smoother.step(0.0, dt, skip_hold=True)  # fade out gently, no capture needed
             else:
                 try:
-                    want_tiles = e.glare_weight > 0 or e.glare_local or e.protected_opacity > 0
+                    want_tiles = e.glare_weight > 0 or e.glare_local
                     interval = self._settings.interval_ms / 1000.0
                     if slot.local_active:
                         interval = 0.033  # a visible local mask follows every frame (moving light)
@@ -883,7 +834,6 @@ class Engine(threading.Thread):
                     and smoother.settled
                     and slot.dim.excluded
                     and not slot.tint_moving(False)
-                    and not slot.blind_pending()
                     and not slot.local_active
                 ):
                     continue  # fast path: no new frame, nothing moving, same profile -> no work
@@ -897,9 +847,6 @@ class Engine(threading.Thread):
                         # measure the next frame at once instead of waiting for the measuring slot.
                         slot.processed_at = 0.0
                     slot.stats = stats
-                    slot.track_black(stats)
-                elif slot.unblack_since is not None:
-                    slot.track_black(slot.stats)  # the timeout to leave runs without new frames
                 weight = e.glare_weight
                 if e.glare_local and (slot.capture is None or slot.local_failed):
                     weight = GLARE_WEIGHTS[2]  # no GPU tiles for a local mask: protect globally instead
@@ -913,11 +860,6 @@ class Engine(threading.Thread):
                     active = True
                 slot.level = level
                 slot.target = target_opacity(level, e.start, e.full, e.max_opacity)
-                if slot.blind and e.protected_opacity > 0 and e.dim_on:
-                    # The capture sees only black (DRM-protected video is blanked in every
-                    # screen capture): the picture cannot be measured, so the profile's fixed
-                    # protection applies instead of "no dimming".
-                    slot.target = max(slot.target, min(e.protected_opacity, e.max_opacity))
                 smoother.step(slot.target, dt)
                 if e.glare_local and slot.capture is not None:
                     slot.update_local(dt, fresh=stats is not None)
@@ -1015,47 +957,20 @@ class Engine(threading.Thread):
         self._publish()
 
     def _resolve_profiles(self) -> None:
-        """Decide per monitor which profile applies: base (fixed or day/night) + app in front."""
-        s = self._settings
-        profiles, rules = s.profile_map(), s.rules
-        windows = windows_per_monitor([slot.monitor for slot in self._slots.values()]) if self._slots else {}
+        """Apply the profile to every monitor; the night window may switch the tint on or off."""
         lt = time.localtime()
         minute = lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60
-        for device, slot in self._slots.items():
-            front = self._confirmed_app(slot, windows.get(device))
-            app, title = front if isinstance(front, tuple) else (front, "")
-            slot.front_exe, slot.front_title = app, title
-            if app and (not self._recent_apps or self._recent_apps[0] != app):
-                if app in self._recent_apps:
-                    self._recent_apps.remove(app)
-                self._recent_apps.appendleft(app)
-            effective = resolve_monitor(profiles, rules, s.schedule, s.base_choice(device), app, minute, title)
-            if effective.label != slot.effective.label:
-                log.info("%s: Profil %s (%s)", slot.monitor.gdi_name, effective.label, effective.reason)
+        effective = resolve(self._settings.profile, minute)
+        for slot in self._slots.values():
+            if effective.tint_on != slot.effective.tint_on:
+                log.info("%s: Blaulichtfilter %s", slot.monitor.gdi_name, "an" if effective.tint_on else "aus")
             if effective != slot.effective:
                 old = slot.effective
                 slot.effective = effective
                 slot.smoother.attack = ATTACK_PRESETS[effective.attack]
                 slot.smoother.release = RELEASE_PRESETS[effective.release]
-                # Wake only for real switches, not for every step of a slow day/night fade.
-                if (old.label, old.dim_on, old.tint_on) != (effective.label, effective.dim_on, effective.tint_on):
+                if (old.dim_on, old.tint_on) != (effective.dim_on, effective.tint_on):
                     self._wake_now = True
-
-    @staticmethod
-    def _confirmed_app(slot: _Slot, seen: tuple[str | None, str] | str | None) -> tuple[str | None, str] | str | None:
-        """Accept a new app in front only when seen twice in a row (~0.25 s): Start menu,
-        Alt+Tab and similar short-lived windows must not make the profile flip back and forth."""
-        if not slot.app_known:
-            slot.app, slot.app_known = seen, True
-        elif seen == slot.app:
-            slot.pending_hits = 0
-        elif seen == slot.pending_app:
-            slot.pending_hits += 1
-            if slot.pending_hits >= APP_CONFIRM:
-                slot.app, slot.pending_hits = seen, 0
-        else:
-            slot.pending_app, slot.pending_hits = seen, 1
-        return slot.app
 
     def _refresh_monitors(self, force: bool = False) -> None:
         monitors = list_monitors()
@@ -1079,7 +994,7 @@ class Engine(threading.Thread):
             self._slots[device] = slot
             self._resolve_profiles()
             if not slot.dim.excluded:
-                log.warning("Overlay kann nicht aus der Messung ausgenommen werden \u2013 Kompensation aktiv")
+                log.warning("Overlay kann nicht aus der Messung ausgenommen werden, Kompensation aktiv")
         with self._lock:
             self._monitors = monitors
         self._publish()
@@ -1087,7 +1002,7 @@ class Engine(threading.Thread):
     def _publish_if_changed(self) -> None:
         """At display rate most rounds change nothing; the GUI needs at most ~10 updates/s."""
         key = tuple(
-            (s.dim.alpha, round(s.tint_strength), round(s.stats.mean), round(s.stats.spot), s.blind)
+            (s.dim.alpha, round(s.tint_strength), round(s.stats.mean), round(s.stats.spot))
             for s in self._slots.values()
         )
         now = time.monotonic()
@@ -1107,15 +1022,11 @@ class Engine(threading.Thread):
                 target=slot.target,
                 opacity=slot.dim.alpha,
                 excluded_from_capture=slot.dim.excluded,
-                profile=slot.effective.label,
-                reason=slot.effective.reason,
-                app=slot.front_exe,
                 tint=slot.tint_strength,
                 start=slot.effective.start if slot.effective.dim_on else None,
                 full=slot.effective.full if slot.effective.dim_on else None,
                 spot=slot.stats.spot,
                 capture=slot.backend,
-                protected=slot.blind,
             )
             for d, slot in sorted(self._slots.items(), key=lambda kv: index.get(kv[0], 99))
         ]
@@ -1123,7 +1034,6 @@ class Engine(threading.Thread):
             self._status.paused = self._paused
             self._status.paused_reason = "user" if self._paused else ""
             self._status.monitors = rows
-            self._status.recent_apps = list(self._recent_apps)
             self._status.heartbeat = time.monotonic()
 
     # ---- Win32 plumbing ----------------------------------------------------------------

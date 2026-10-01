@@ -7,12 +7,16 @@ import ctypes
 import dataclasses
 import logging
 import logging.handlers
+import os
 import sys
-import tkinter as tk
-from tkinter import messagebox
+import threading
+from typing import TYPE_CHECKING
 
 from . import settings as settings_mod
 from .winapi import enable_dpi_awareness
+
+if TYPE_CHECKING:
+    from .gui import QueueLogHandler
 
 log = logging.getLogger("dimmer")
 
@@ -36,7 +40,12 @@ def _single_instance() -> object | None:
     return handle
 
 
-def _setup_logging(verbose: bool) -> logging.Handler:
+def _message_box(text: str) -> None:
+    MB_ICONINFORMATION = 0x40
+    ctypes.windll.user32.MessageBoxW(None, text, "Adaptive Screen Dimmer", MB_ICONINFORMATION)
+
+
+def _setup_logging(verbose: bool) -> QueueLogHandler:
     from .gui import QueueLogHandler
 
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -65,10 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     enable_dpi_awareness()  # before any window exists
     mutex = _single_instance()
     if mutex is None:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo("Adaptive Screen Dimmer", "Das Programm läuft bereits.")
-        root.destroy()
+        _message_box("Das Programm läuft bereits. Du findest es unten rechts im Infobereich.")
         return 1
 
     queue_handler = _setup_logging(args.verbose)
@@ -79,23 +85,25 @@ def main(argv: list[str] | None = None) -> int:
     settings = settings_mod.load()
     # --paused applies to this run only and must not end up in the saved settings
     engine_settings = dataclasses.replace(settings, start_paused=True) if args.paused else settings
-    log.info("Start – %d Profile, %d Programmregeln", len(settings.profiles), len(settings.rules))
+    log.info("Start")
 
     engine = Engine(engine_settings)
     engine.start()
     tray = TrayIcon()
     tray.start()
     tray.wait_ready()
-    root = tk.Tk()
-    root.report_callback_exception = lambda *exc: log.error("GUI-Fehler", exc_info=exc)
-    ui = DimmerApp(root, engine, settings, queue_handler, tray if tray.is_alive() else None)  # type: ignore[arg-type]
-    root.protocol("WM_DELETE_WINDOW", ui.close_window)
+    hidden = settings.start_minimized and tray.is_alive()
+    ui = DimmerApp(engine, settings, queue_handler, tray if tray.is_alive() else None, start_hidden=hidden)
     if args.exit_after:
-        root.after(int(args.exit_after * 1000), ui.quit)
-    if settings.start_minimized and tray.is_alive():
-        root.withdraw()
+        timer = threading.Timer(args.exit_after, ui.quit)
+        timer.daemon = True
+        timer.start()
+        # Hard fallback in case the window never came up and could not be closed normally.
+        hard = threading.Timer(args.exit_after + 15, lambda: os._exit(2))
+        hard.daemon = True
+        hard.start()
     try:
-        root.mainloop()
+        ui.run()
     finally:
         engine.stop()  # overlays are destroyed on the engine thread
         tray.close()

@@ -21,8 +21,7 @@ log = logging.getLogger("dimmer")
 
 WM_TRAY = win32con.WM_USER + 20
 WM_UPDATE = win32con.WM_USER + 21
-CMD_TOGGLE, CMD_SHOW, CMD_QUIT, CMD_AUTO = 1, 2, 3, 4
-CMD_PROFILE = 100  # + index of the profile
+CMD_TOGGLE, CMD_SHOW, CMD_QUIT = 1, 2, 3
 CLASS_NAME = "AdaptiveScreenDimmerTray"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -86,14 +85,9 @@ class TrayIcon(threading.Thread):
         self._tip = "Adaptive Screen Dimmer"
         self._ready = threading.Event()
         self._icons: dict[bool, int] = {}
-        self._profiles: list[str] = []
-        self._menu_profiles: list[str] = []
-        self._current = ""  # base profile of all monitors ("auto", a name, or "" when mixed)
 
     # thread-safe API
-    def set_state(self, paused: bool, tip: str, profiles: list[str] | None = None, current: str = "") -> None:
-        if profiles is not None:
-            self._profiles, self._current = list(profiles), current  # read when the menu opens
+    def set_state(self, paused: bool, tip: str) -> None:
         if paused == self._paused and tip[:127] == self._tip:
             return
         self._paused, self._tip = paused, tip[:127]
@@ -160,12 +154,7 @@ class TrayIcon(threading.Thread):
                 return 0
             if msg == win32con.WM_COMMAND:
                 cmd = win32api.LOWORD(wp)
-                if cmd == CMD_AUTO:
-                    self.actions.put("base:auto")
-                elif CMD_PROFILE <= cmd < CMD_PROFILE + len(self._menu_profiles):
-                    self.actions.put("base:" + self._menu_profiles[cmd - CMD_PROFILE])
-                else:
-                    self.actions.put({CMD_TOGGLE: "toggle", CMD_SHOW: "show", CMD_QUIT: "quit"}.get(cmd, ""))
+                self.actions.put({CMD_TOGGLE: "toggle", CMD_SHOW: "show", CMD_QUIT: "quit"}.get(cmd, ""))
                 return 0
             if msg == win32con.WM_CLOSE:
                 self._notify(win32gui.NIM_DELETE, hwnd)
@@ -185,18 +174,7 @@ class TrayIcon(threading.Thread):
     def _menu(self) -> None:
         menu = win32gui.CreatePopupMenu()
         win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_TOGGLE, "Fortsetzen" if self._paused else "Pausieren")
-        sub = win32gui.CreatePopupMenu()
-        self._menu_profiles = list(self._profiles)
-
-        def flags(value: str) -> int:
-            return win32con.MF_STRING | (win32con.MF_CHECKED if value == self._current else 0)
-
-        win32gui.AppendMenu(sub, flags("auto"), CMD_AUTO, "Automatisch (Tag/Nacht)")
-        win32gui.AppendMenu(sub, win32con.MF_SEPARATOR, 0, "")
-        for i, name in enumerate(self._menu_profiles):
-            win32gui.AppendMenu(sub, flags(name), CMD_PROFILE + i, name)
-        win32gui.AppendMenu(menu, win32con.MF_POPUP, sub, "Alle Bildschirme")
-        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_SHOW, "Fenster anzeigen")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_SHOW, "Fenster öffnen")
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_QUIT, "Beenden")
         x, y = win32gui.GetCursorPos()

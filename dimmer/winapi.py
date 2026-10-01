@@ -3,24 +3,20 @@
 from __future__ import annotations
 
 import ctypes
-import os
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
 import numpy as np
 import win32api
 import win32con
-import win32gui
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 WDA_NONE = 0x0
 WDA_EXCLUDEFROMCAPTURE = 0x11
-PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 user32.GetDC.restype = wintypes.HDC
 user32.GetDC.argtypes = [wintypes.HWND]
@@ -28,7 +24,6 @@ user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
 user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
 user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.DeleteDC.argtypes = [wintypes.HDC]
@@ -45,15 +40,6 @@ gdi32.CreateDIBSection.argtypes = [
     ctypes.POINTER(ctypes.c_void_p),
     wintypes.HANDLE,
     wintypes.DWORD,
-]
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-kernel32.QueryFullProcessImageNameW.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPWSTR,
-    ctypes.POINTER(wintypes.DWORD),
 ]
 
 
@@ -234,183 +220,3 @@ class Sampler:
         if self._own_dc and self.src_dc:
             user32.ReleaseDC(None, self.src_dc)
             self.src_dc = None
-
-
-def _window_pid(hwnd: int) -> int:
-    pid = wintypes.DWORD()
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return int(pid.value)
-
-
-def _exe_name(pid: int) -> str | None:
-    exe = None
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if handle:
-        try:
-            size = wintypes.DWORD(1024)
-            buf = ctypes.create_unicode_buffer(size.value)
-            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-                exe = os.path.basename(buf.value).lower()
-        finally:
-            kernel32.CloseHandle(handle)
-    return exe
-
-
-UWP_HOST = "applicationframehost.exe"
-
-
-# (hwnd, pid) -> exe. Keyed by both: pids and window handles are each reused by Windows, the pair
-# practically never; entries of vanished windows are dropped on every scan.
-_window_cache: dict[tuple[int, int], str | None] = {}
-
-
-def window_exe(hwnd: int) -> str | None:
-    key = (hwnd, _window_pid(hwnd))
-    if key not in _window_cache:
-        _window_cache[key] = _window_exe_uncached(hwnd)
-    return _window_cache[key]
-
-
-def _window_exe_uncached(hwnd: int) -> str | None:
-    """Lower-case exe name owning a top-level window, None if unknown or our own.
-
-    Store apps are hosted by ApplicationFrameHost; for those the app's own process (owner of
-    the hosted child window) is returned, so a rule never covers all Store apps at once.
-    """
-    pid = _window_pid(hwnd)
-    if not pid or pid == os.getpid():
-        return None
-    exe = _exe_name(pid)
-    if exe == UWP_HOST:
-        children: list[int] = []
-
-        def collect(child: int, _extra: object) -> bool:
-            children.append(child)
-            return True
-
-        try:
-            win32gui.EnumChildWindows(hwnd, collect, None)
-        except win32gui.error:
-            pass
-        for child in children:
-            child_pid = _window_pid(child)
-            if child_pid and child_pid != pid:
-                return _exe_name(child_pid) or exe
-    return exe
-
-
-def foreground_exe() -> str | None:
-    hwnd = user32.GetForegroundWindow()
-    return window_exe(hwnd) if hwnd else None
-
-
-DWMWA_CLOAKED = 14
-_dwmapi = ctypes.WinDLL("dwmapi")
-_dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.IsIconic.argtypes = [wintypes.HWND]
-user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-user32.GetShellWindow.restype = wintypes.HWND
-EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
-GWL_EXSTYLE = -20
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_NOACTIVATE = 0x08000000
-# Shell surfaces that are not "an app open on this monitor": desktop, taskbars, Start/Search,
-# Alt+Tab, Task View, flyouts. They must never switch a monitor's profile.
-SHELL_CLASSES = {
-    "Progman",
-    "WorkerW",
-    "Shell_TrayWnd",
-    "Shell_SecondaryTrayWnd",
-    "Windows.UI.Core.CoreWindow",
-    "XamlExplorerHostIslandWindow",
-    "MultitaskingViewFrame",
-    "TaskSwitcherWnd",
-    "ForegroundStaging",
-    "NotifyIconOverflowWindow",
-    "TopLevelWindowForOverflowXamlIsland",
-}
-# Apps must cover at least this share of a monitor to count as "open on" it (skips popups,
-# notifications and small tool windows).
-MIN_COVERAGE = 0.25
-
-
-def _is_cloaked(hwnd: int) -> bool:
-    cloaked = wintypes.DWORD()
-    ok = _dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
-    return ok == 0 and bool(cloaked.value)
-
-
-def top_windows() -> list[int]:
-    """Top-level windows in z-order, topmost first."""
-    result: list[int] = []
-
-    @EnumWindowsProc
-    def collect(hwnd: int, _lp: int) -> bool:
-        result.append(hwnd)
-        return True
-
-    user32.EnumWindows(collect, 0)
-    return result
-
-
-def apps_per_monitor(monitors: list[Monitor]) -> dict[str, str | None]:
-    """For each monitor the exe of the topmost real app window on it (None: only desktop)."""
-    return {d: exe for d, (exe, _title) in windows_per_monitor(monitors).items()}
-
-
-def _window_title(hwnd: int) -> str:
-    try:
-        return str(win32gui.GetWindowText(hwnd))
-    except win32gui.error:
-        return ""
-
-
-def windows_per_monitor(monitors: list[Monitor]) -> dict[str, tuple[str | None, str]]:
-    """For each monitor (exe, title) of the topmost real app window on it."""
-    found: dict[str, tuple[str | None, str]] = {}
-    rect = wintypes.RECT()
-    shell = user32.GetShellWindow()
-    alive: set[tuple[int, int]] = set()
-    for hwnd in top_windows():
-        if len(found) == len(monitors):
-            break
-        if hwnd == shell or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
-            continue
-        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) or _is_cloaked(hwnd):
-            continue  # WS_EX_TRANSPARENT: click-through overlays of other tools
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            continue
-        # A window counts on every monitor it covers enough (a window spanning two monitors
-        # applies its profile on both).
-        covered = []
-        for m in monitors:
-            if m.device in found:
-                continue
-            w = min(rect.right, m.left + m.width) - max(rect.left, m.left)
-            h = min(rect.bottom, m.top + m.height) - max(rect.top, m.top)
-            if w > 0 and h > 0 and w * h / float(m.width * m.height) >= MIN_COVERAGE:
-                covered.append(m)
-        if not covered:
-            continue
-        try:
-            if win32gui.GetClassName(hwnd) in SHELL_CLASSES:
-                continue
-        except win32gui.error:
-            continue
-        pid = _window_pid(hwnd)
-        if pid == os.getpid():
-            continue  # our own window: look at what is underneath
-        alive.add((hwnd, pid))
-        exe = window_exe(hwnd)
-        title = _window_title(hwnd)
-        for m in covered:
-            found[m.device] = (exe, title)
-    for key in [k for k in _window_cache if k not in alive]:
-        if len(_window_cache) > 64:
-            _window_cache.pop(key, None)
-    return found

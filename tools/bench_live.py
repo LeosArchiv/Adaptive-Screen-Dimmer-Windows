@@ -59,10 +59,9 @@ def main() -> None:
     root.configure(bg="black")
     root.attributes("-topmost", True)
 
-    # fixed "Tag" profile: the result must not depend on the time of day
-    settings = Settings(
-        monitors=[mon.device], monitor_profiles={mon.device: "Tag"}, rules=[], interval_ms=args.interval, hotkey=False
-    )
+    # default profile without the blue-light filter: the result must not depend on the time of day
+    settings = Settings(monitors=[mon.device], interval_ms=args.interval, hotkey=False)
+    settings.profile.tint_on = False
     engine = Engine(settings)
     engine.start()
     engine.wait_ready()
