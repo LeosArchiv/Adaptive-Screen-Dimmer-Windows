@@ -106,7 +106,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ui.run()
     finally:
+        log.debug("window closed, stopping engine")
         engine.stop()  # overlays are destroyed on the engine thread
+        log.debug("engine stopped, removing tray icon")
         tray.close()
     log.info("Stopped")
     return 0
