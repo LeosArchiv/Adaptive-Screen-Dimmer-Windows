@@ -13,6 +13,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from . import settings as settings_mod
+from .i18n import resolve_language, t
 from .winapi import enable_dpi_awareness
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ def _single_instance() -> object | None:
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if not handle:  # could not create the guard at all: run without it rather than refuse
-        log.warning("Einzelinstanz-Sperre nicht verfügbar (%d)", ctypes.get_last_error())
+        log.warning("Single instance lock not available (%d)", ctypes.get_last_error())
         return True
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(handle)
@@ -74,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     enable_dpi_awareness()  # before any window exists
     mutex = _single_instance()
     if mutex is None:
-        _message_box("Das Programm läuft bereits. Du findest es unten rechts im Infobereich.")
+        _message_box(t(resolve_language(settings_mod.load().language), "already_running"))
         return 1
 
     queue_handler = _setup_logging(args.verbose)
@@ -107,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         engine.stop()  # overlays are destroyed on the engine thread
         tray.close()
-    log.info("Beendet")
+    log.info("Stopped")
     return 0
 
 
@@ -115,5 +116,5 @@ def run() -> None:
     try:
         sys.exit(main())
     except Exception:
-        log.exception("Unerwarteter Fehler")
+        log.exception("Unexpected error")
         raise

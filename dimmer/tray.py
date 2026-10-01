@@ -1,6 +1,6 @@
 """Notification-area (tray) icon on its own thread with its own hidden window.
 
-It never touches Tk: menu choices are put into ``TrayIcon.actions`` and the GUI drains that
+It never touches the window: menu choices are put into ``TrayIcon.actions`` and the GUI drains that
 queue on its own thread. ``set_state`` may be called from any thread.
 """
 
@@ -16,6 +16,8 @@ import numpy as np
 import win32api
 import win32con
 import win32gui
+
+from .i18n import t
 
 log = logging.getLogger("dimmer")
 
@@ -85,6 +87,7 @@ class TrayIcon(threading.Thread):
         self._tip = "Adaptive Screen Dimmer"
         self._ready = threading.Event()
         self._icons: dict[bool, int] = {}
+        self._lang = "en"
 
     # thread-safe API
     def set_state(self, paused: bool, tip: str) -> None:
@@ -93,6 +96,10 @@ class TrayIcon(threading.Thread):
         self._paused, self._tip = paused, tip[:127]
         if self._hwnd:
             win32gui.PostMessage(self._hwnd, WM_UPDATE, 0, 0)
+
+    def set_language(self, lang: str) -> None:
+        """Menu texts; the menu is built on every right click, so this applies at once."""
+        self._lang = lang
 
     def close(self) -> None:
         """Remove the icon and end the thread. Safe to call more than once."""
@@ -124,7 +131,7 @@ class TrayIcon(threading.Thread):
             self._icons = {False: make_icon(ACTIVE_COLOR), True: make_icon(PAUSED_COLOR)}
             self._notify(win32gui.NIM_ADD)
         except Exception:
-            log.exception("Tray-Symbol konnte nicht erstellt werden")
+            log.exception("Could not create the tray icon")
             self._ready.set()
             return
         self._ready.set()
@@ -167,16 +174,18 @@ class TrayIcon(threading.Thread):
                 self._notify(win32gui.NIM_ADD)
                 return 0
         except Exception:
-            log.exception("Tray-Fehler")
+            log.exception("Tray error")
             return 0
         return int(win32gui.DefWindowProc(hwnd, msg, wp, lp))
 
     def _menu(self) -> None:
         menu = win32gui.CreatePopupMenu()
-        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_TOGGLE, "Fortsetzen" if self._paused else "Pausieren")
-        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_SHOW, "Fenster öffnen")
+        lang = self._lang
+        toggle = t(lang, "tray_resume" if self._paused else "tray_pause")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_TOGGLE, toggle)
+        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_SHOW, t(lang, "tray_open"))
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
-        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_QUIT, "Beenden")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, CMD_QUIT, t(lang, "tray_quit"))
         x, y = win32gui.GetCursorPos()
         win32gui.SetForegroundWindow(self._hwnd)  # required so the menu closes when clicking elsewhere
         win32gui.TrackPopupMenu(menu, win32con.TPM_RIGHTBUTTON, x, y, 0, self._hwnd, None)

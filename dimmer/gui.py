@@ -19,6 +19,7 @@ from typing import Any
 
 from . import settings as settings_mod
 from .engine import Engine, Status, wanted_devices
+from .i18n import LANGUAGES, resolve_language, t
 from .logic import ATTACK_PRESETS, RELEASE_PRESETS
 from .profiles import KELVIN_MAX, KELVIN_MIN, TINT_MAX, Profile, kelvin_to_rgb, tint_active_now
 from .settings import Settings
@@ -33,7 +34,6 @@ TRAY_POLL_S = 0.1
 LOG_BATCH = 200
 # Measurements per second while something moves; still screens are measured at half the rate.
 RATE_PRESETS = {"Sparsam": 100, "Normal": 50, "Schnell": 33}
-GLARE_NAMES = ["Aus", "Normal", "Stark", "Lokal"]
 PROFILE_FIELDS = {f.name for f in dataclasses.fields(Profile)}
 # Fields each "Standardwerte" button puts back; profile fields unknown to Profile are skipped.
 RESET_SECTIONS: dict[str, tuple[str, ...]] = {
@@ -42,7 +42,7 @@ RESET_SECTIONS: dict[str, tuple[str, ...]] = {
     "tint": ("tint_on", "tint_kelvin", "tint_strength", "tint_night_only", "night_start", "day_start"),
     "options": ("interval_ms", "hotkey", "start_paused", "close_to_tray", "start_minimized"),
 }
-SECTION_NAMES = {"dim": "Abdunkeln", "glare": "Helle Flecken", "tint": "Blaulichtfilter", "options": "Optionen"}
+SECTION_NAMES = {"dim": "dimming", "glare": "bright spots", "tint": "blue light filter", "options": "options"}
 
 
 def web_dir() -> Path:
@@ -121,7 +121,7 @@ class Api:
         try:
             settings_mod.save(s)
         except OSError as e:
-            log.warning("Einstellungen konnten nicht gespeichert werden: %s", e)
+            log.warning("Could not save settings: %s", e)
 
     # ---- called from JavaScript ------------------------------------------------------------------
     def get_state(self) -> dict[str, Any]:
@@ -132,10 +132,10 @@ class Api:
             "profile": dataclasses.asdict(s.profile),
             "defaults": dataclasses.asdict(Profile()),
             "options": _options(s),
+            "lang": resolve_language(s.language),
             "choices": {
                 "attack": list(ATTACK_PRESETS),
                 "release": list(RELEASE_PRESETS),
-                "glare": GLARE_NAMES,
                 "rate": list(RATE_PRESETS),
             },
             "limits": {"kelvin_min": KELVIN_MIN, "kelvin_max": KELVIN_MAX, "tint_max": TINT_MAX},
@@ -149,7 +149,7 @@ class Api:
             try:
                 profile = dataclasses.replace(self._settings.profile, **changes).normalized()
             except (TypeError, ValueError) as e:
-                log.warning("Ungültige Profilwerte: %s", e)
+                log.warning("Invalid profile values: %s", e)
                 profile = self._settings.profile
             self._apply(dataclasses.replace(self._settings, profile=profile))
             return dataclasses.asdict(self._settings.profile)
@@ -167,19 +167,27 @@ class Api:
                 changes = {f: getattr(base, f) for f in fields if f in PROFILE_FIELDS}
                 new = dataclasses.replace(s, profile=dataclasses.replace(s.profile, **changes))
             self._apply(new)
-            log.info("Standardwerte wiederhergestellt (%s)", SECTION_NAMES.get(section, section))
+            log.info("Reset %s to defaults", SECTION_NAMES.get(section, section))
             return {"profile": dataclasses.asdict(self._settings.profile), "options": _options(self._settings)}
 
-    def set_option(self, name: str, value: Any) -> None:
+    def set_option(self, name: str, value: Any) -> str:
+        """Changes one option; returns the language to show (it may just have changed)."""
         with self._lock:
             s = self._settings
             if name == "rate" and value in RATE_PRESETS:
                 new = dataclasses.replace(s, interval_ms=RATE_PRESETS[value])
+            elif name == "language" and value in ("auto", *LANGUAGES):
+                new = dataclasses.replace(s, language=value)
             elif name in ("hotkey", "start_paused", "close_to_tray", "start_minimized"):
                 new = dataclasses.replace(s, **{name: bool(value)})  # type: ignore[arg-type]
             else:
-                return
+                return self.language()
             self._apply(new)
+        return self.language()
+
+    def language(self) -> str:
+        """The language shown right now ('de' or 'en')."""
+        return resolve_language(self._settings.language)
 
     def toggle_pause(self) -> bool:
         self._engine.toggle_paused()
@@ -250,20 +258,22 @@ def _options(s: Settings) -> dict[str, Any]:
         "start_paused": s.start_paused,
         "close_to_tray": s.close_to_tray,
         "start_minimized": s.start_minimized,
+        "language": s.language,
     }
 
 
 def _state(st: Status) -> dict[str, str]:
+    """Kind and reason; the page turns the reason into text in its language."""
     stalled = st.running and st.heartbeat and time.monotonic() - st.heartbeat > STALL_S
     if st.error:
-        return {"kind": "error", "text": f"Fehler: {st.error}"}
+        return {"kind": "error", "reason": "error", "detail": str(st.error)}
     if stalled:
-        return {"kind": "error", "text": "Reagiert nicht"}
+        return {"kind": "error", "reason": "stalled"}
     if not st.running:
-        return {"kind": "error", "text": "Gestoppt"}
+        return {"kind": "error", "reason": "stopped"}
     if st.paused_reason == "user":
-        return {"kind": "paused", "text": "Pausiert"}
-    return {"kind": "ok", "text": "Aktiv"}
+        return {"kind": "paused", "reason": "paused"}
+    return {"kind": "ok", "reason": "ok"}
 
 
 def _place(title: str, x: int, y: int) -> None:
@@ -363,7 +373,7 @@ class DimmerApp:
         windows = []
         for i, m in enumerate(self.engine.monitors()):
             w = self._webview.create_window(
-                f"Bildschirm {i + 1}",
+                f"{TITLE} {i + 1}",
                 html=IDENTIFY_HTML.format(n=i + 1),
                 x=m.left + 48,
                 y=m.top + 48,
@@ -379,7 +389,7 @@ class DimmerApp:
             )
             if w is not None:
                 windows.append(w)
-                w.events.shown += functools.partial(_place, f"Bildschirm {i + 1}", m.left + 48, m.top + 48)
+                w.events.shown += functools.partial(_place, f"{TITLE} {i + 1}", m.left + 48, m.top + 48)
 
         def close() -> None:
             for w in windows:
@@ -396,6 +406,7 @@ class DimmerApp:
         while not self._stop.wait(TRAY_POLL_S):
             if not self.tray:
                 continue
+            self.tray.set_language(self.api.language())
             try:
                 while True:
                     action = self.tray.actions.get_nowait()
@@ -414,7 +425,7 @@ class DimmerApp:
             st = self.engine.snapshot()
             paused = st.paused_reason == "user"
             if paused:
-                tip = f"{TITLE}: pausiert"
+                tip = f"{TITLE}: {t(self.api.language(), 'tip_paused')}"
             else:
                 parts = [f"{i + 1}: {round(m.opacity / 255 * 100)} %" for i, m in enumerate(st.monitors)]
                 tip = f"{TITLE}: " + ", ".join(parts)
