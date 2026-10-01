@@ -31,7 +31,7 @@
   <section class="block">
     <div class="block-head">
       <h2>Abdunkeln</h2>
-      <button class="btn subtle" id="reset" type="button">Standardwerte</button>
+      <button class="btn subtle" data-reset="dim" type="button">Standardwerte</button>
     </div>
     <div class="group">
       <div class="row">
@@ -47,16 +47,43 @@
         <div class="row-ctl slider"><input type="range" id="max" min="0" max="94"><output id="max-out"></output></div>
       </div>
       <div class="row">
-        <div class="row-label"><span>Reaktion beim Abdunkeln</span></div>
+        <div class="row-label"><span>Dunkler werden</span></div>
         <div class="row-ctl"><div class="seg" id="attack"></div></div>
       </div>
       <div class="row">
-        <div class="row-label"><span>Reaktion beim Aufhellen</span></div>
+        <div class="row-label"><span>Heller werden</span></div>
         <div class="row-ctl"><div class="seg" id="release"></div></div>
       </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Helle Flecken</h2>
+      <button class="btn subtle" data-reset="glare" type="button">Standardwerte</button>
+    </div>
+    <div class="group">
       <div class="row">
-        <div class="row-label"><span>Helle Flecken</span><small>Lokal: nur die grellen Stellen</small></div>
+        <div class="row-label"><span>Modus</span><small>Lokal dunkelt nur die grelle Stelle ab</small></div>
         <div class="row-ctl"><div class="seg" id="glare"></div></div>
+      </div>
+      <div class="local" id="glare-local">
+        <div class="row">
+          <div class="row-label"><span>Empfindlichkeit</span><small>kleiner reagiert früher</small></div>
+          <div class="row-ctl slider"><input type="range" id="glare_contrast" min="3" max="12"><output id="glare_contrast-out"></output></div>
+        </div>
+        <div class="row">
+          <div class="row-label"><span>Stärke</span></div>
+          <div class="row-ctl slider"><input type="range" id="glare_strength" min="20" max="90"><output id="glare_strength-out"></output></div>
+        </div>
+        <div class="row">
+          <div class="row-label"><span>Rand</span></div>
+          <div class="row-ctl"><div class="seg" id="glare_margin"></div></div>
+        </div>
+        <div class="row">
+          <div class="row-label"><span>Ausblenden</span></div>
+          <div class="row-ctl slider"><input type="range" id="glare_fade_ms" min="100" max="1500" step="50"><output id="glare_fade_ms-out"></output></div>
+        </div>
       </div>
     </div>
   </section>
@@ -64,7 +91,10 @@
   <section class="block">
     <div class="block-head">
       <h2>Blaulichtfilter</h2>
-      <label class="toggle"><input type="checkbox" id="tint_on" role="switch"><span class="track"></span></label>
+      <div class="head-ctl">
+        <button class="btn subtle" data-reset="tint" type="button">Standardwerte</button>
+        <label class="toggle"><input type="checkbox" id="tint_on" role="switch" aria-label="Blaulichtfilter"><span class="track"></span></label>
+      </div>
     </div>
     <div class="group" id="tint-group">
       <div class="row">
@@ -81,14 +111,17 @@
           <input type="time" id="night_start" aria-label="von">
           <span class="to">bis</span>
           <input type="time" id="day_start" aria-label="bis">
-          <label class="toggle"><input type="checkbox" id="tint_night_only" role="switch"><span class="track"></span></label>
+          <label class="toggle"><input type="checkbox" id="tint_night_only" role="switch" aria-label="Nur nachts"><span class="track"></span></label>
         </div>
       </div>
     </div>
   </section>
 
   <section class="block">
-    <h2>Optionen</h2>
+    <div class="block-head">
+      <h2>Optionen</h2>
+      <button class="btn subtle" data-reset="options" type="button">Standardwerte</button>
+    </div>
     <div class="group">
       <div class="row">
         <div class="row-label"><span>Messrate</span></div>

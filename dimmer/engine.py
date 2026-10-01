@@ -408,11 +408,16 @@ class _Slot:
             # self.tiles is always the newest picture: after pause/clear/restart the mask is
             # restored at once, not only when the picture changes again.
             w, h = self.frame_size
-            self.mask_target = local_target(tile_means(self.tiles, w, h), self.stats.background)
+            self.mask_target = local_target(tile_means(self.tiles, w, h), self.stats.background, self.effective.local)
         now = time.perf_counter()
         if not fresh and now - self._mask_shown_at < LOCAL_REDRAW_S:
             return  # fades are redrawn at ~30 Hz, fast enough to look continuous
-        mask = blend_mask(self.mask_target, self.mask, now - self._mask_shown_at if self.mask is not None else dt)
+        mask = blend_mask(
+            self.mask_target,
+            self.mask,
+            now - self._mask_shown_at if self.mask is not None else dt,
+            self.effective.local.release_s,
+        )
         if self.mask is not None and mask.shape == self.mask.shape and np.allclose(mask, self.mask, atol=0.004):
             # Nothing visible changes this round; keep going until the target is reached (the
             # next step gets a longer dt, so a slow fade still finishes and the layer hides).
@@ -969,6 +974,9 @@ class Engine(threading.Thread):
                 slot.effective = effective
                 slot.smoother.attack = ATTACK_PRESETS[effective.attack]
                 slot.smoother.release = RELEASE_PRESETS[effective.release]
+                if old.local != effective.local and slot.mask is not None:
+                    slot.mask_target = None  # recompute with the new spot settings, even on a still picture
+                    slot._mask_moving = True
                 if (old.dim_on, old.tint_on) != (effective.dim_on, effective.tint_on):
                     self._wake_now = True
 

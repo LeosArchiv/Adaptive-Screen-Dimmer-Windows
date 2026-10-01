@@ -11,7 +11,7 @@ import dataclasses
 import math
 from dataclasses import dataclass
 
-from .logic import ATTACK_PRESETS, RELEASE_PRESETS
+from .logic import ATTACK_PRESETS, RELEASE_PRESETS, LocalParams
 
 KELVIN_MIN, KELVIN_MAX = 1900, 6500
 TINT_MAX = 60  # percent; stronger tints wash the picture out too much
@@ -33,6 +33,10 @@ class Profile:
     attack: str = "Schnell"
     release: str = "Normal"
     glare: int = 0  # 0 aus, 1 normal, 2 stark, 3 lokal
+    glare_contrast: int = 6  # lokal: a spot counts when this many times brighter than the surroundings
+    glare_strength: int = 75  # lokal: strongest darkening of a spot in percent
+    glare_margin: int = 1  # lokal: extra border around a spot in 16 px tiles
+    glare_fade_ms: int = 300  # lokal: how long the darkening takes to fade out
     tint_on: bool = False
     tint_kelvin: int = 3400
     tint_strength: int = 30  # percent
@@ -51,6 +55,10 @@ class Profile:
         if not isinstance(p.release, str) or p.release not in RELEASE_PRESETS:
             p.release = defaults.release
         p.glare = clamp(p.glare, 0, len(GLARE_WEIGHTS) - 1)
+        p.glare_contrast = clamp(p.glare_contrast, 3, 12)
+        p.glare_strength = clamp(p.glare_strength, 20, 90)
+        p.glare_margin = clamp(p.glare_margin, 0, 2)
+        p.glare_fade_ms = clamp(p.glare_fade_ms, 100, 1500)
         for name in ("tint_on", "tint_night_only"):
             if not isinstance(getattr(p, name), bool):  # "false" as a string must not mean True
                 setattr(p, name, getattr(defaults, name))
@@ -118,6 +126,7 @@ class Effective:
     tint_strength: float = 0  # percent
     glare_weight: float = 0.0
     glare_local: bool = False  # darken only glaring areas (local dimming layer)
+    local: LocalParams = LocalParams()
     label: str = ""
     reason: str = ""
 
@@ -137,6 +146,12 @@ def resolve(p: Profile, minute_of_day: float) -> Effective:
         tint_strength=p.tint_strength if tint else 0,
         glare_weight=GLARE_WEIGHTS[p.glare],
         glare_local=p.glare == GLARE_LOCAL,
+        local=LocalParams(
+            contrast=float(p.glare_contrast),
+            max_alpha=p.glare_strength / 100,
+            margin=p.glare_margin,
+            release_s=p.glare_fade_ms / 1000,
+        ),
         label=PROFILE_LABEL,
         reason="Nacht" if p.tint_on and p.tint_night_only and tint else "",
     )

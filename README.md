@@ -52,12 +52,15 @@ One window, top to bottom:
   Next to it the current dimming and filter in percent, and a switch to dim that monitor or not.
   "Nummern zeigen" flashes the number of each monitor on screen.
 - **Abdunkeln**: Beginn, Volle Stärke ab, Stärkste Abdunkelung (capped at 94 %, never black),
-  how fast it darkens and brightens again, and Helle Flecken (aus, normal, stark for the whole
-  screen, lokal for only the glaring area). "Standardwerte" resets the profile.
+  and how fast it gets darker and brighter again.
+- **Helle Flecken**: Aus, Normal, Stark (whole screen) or Lokal (only the glaring area). With
+  Lokal: Empfindlichkeit (how many times brighter than the surroundings a spot has to be),
+  Stärke, Rand (Eng, Normal, Weit) and Ausblenden (how slowly the darkening disappears).
 - **Blaulichtfilter**: on or off, colour temperature (lower is warmer), strength up to 60 %, and
   "Nur nachts" with two times.
 - **Optionen**: Messrate (Sparsam 10/s, Normal 20/s, Schnell 30/s while the screen changes, half
   when it is still), hotkey, start paused, close to tray, start minimized. Below that the log.
+- Every section has a "Standardwerte" button that resets only that section.
 
 Every change applies at once and is saved automatically.
 Command line: `--paused`, `--exit-after SEC` (quits automatically), `--verbose`.

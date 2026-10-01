@@ -35,6 +35,14 @@ LOG_BATCH = 200
 RATE_PRESETS = {"Sparsam": 100, "Normal": 50, "Schnell": 33}
 GLARE_NAMES = ["Aus", "Normal", "Stark", "Lokal"]
 PROFILE_FIELDS = {f.name for f in dataclasses.fields(Profile)}
+# Fields each "Standardwerte" button puts back; profile fields unknown to Profile are skipped.
+RESET_SECTIONS: dict[str, tuple[str, ...]] = {
+    "dim": ("start", "full", "max_opacity", "attack", "release"),
+    "glare": ("glare", "glare_contrast", "glare_strength", "glare_margin", "glare_fade_ms"),
+    "tint": ("tint_on", "tint_kelvin", "tint_strength", "tint_night_only", "night_start", "day_start"),
+    "options": ("interval_ms", "hotkey", "start_paused", "close_to_tray", "start_minimized"),
+}
+SECTION_NAMES = {"dim": "Abdunkeln", "glare": "Helle Flecken", "tint": "Blaulichtfilter", "options": "Optionen"}
 
 
 def web_dir() -> Path:
@@ -122,13 +130,8 @@ class Api:
             s = self._settings
         return {
             "profile": dataclasses.asdict(s.profile),
-            "options": {
-                "rate": rate_name(s.interval_ms),
-                "hotkey": s.hotkey,
-                "start_paused": s.start_paused,
-                "close_to_tray": s.close_to_tray,
-                "start_minimized": s.start_minimized,
-            },
+            "defaults": dataclasses.asdict(Profile()),
+            "options": _options(s),
             "choices": {
                 "attack": list(ATTACK_PRESETS),
                 "release": list(RELEASE_PRESETS),
@@ -151,11 +154,21 @@ class Api:
             self._apply(dataclasses.replace(self._settings, profile=profile))
             return dataclasses.asdict(self._settings.profile)
 
-    def reset_profile(self) -> dict[str, Any]:
+    def reset_section(self, section: str) -> dict[str, Any]:
+        """Puts the fields of one section back to their defaults; returns profile and options."""
         with self._lock:
-            self._apply(dataclasses.replace(self._settings, profile=Profile()))
-            log.info("Profil auf Standardwerte zurückgesetzt")
-            return dataclasses.asdict(self._settings.profile)
+            s = self._settings
+            fields = RESET_SECTIONS.get(section, ())
+            if section == "options":
+                defaults = Settings()
+                new = dataclasses.replace(s, **{f: getattr(defaults, f) for f in fields})
+            else:
+                base = Profile()
+                changes = {f: getattr(base, f) for f in fields if f in PROFILE_FIELDS}
+                new = dataclasses.replace(s, profile=dataclasses.replace(s.profile, **changes))
+            self._apply(new)
+            log.info("Standardwerte wiederhergestellt (%s)", SECTION_NAMES.get(section, section))
+            return {"profile": dataclasses.asdict(self._settings.profile), "options": _options(self._settings)}
 
     def set_option(self, name: str, value: Any) -> None:
         with self._lock:
@@ -230,6 +243,16 @@ class Api:
         }
 
 
+def _options(s: Settings) -> dict[str, Any]:
+    return {
+        "rate": rate_name(s.interval_ms),
+        "hotkey": s.hotkey,
+        "start_paused": s.start_paused,
+        "close_to_tray": s.close_to_tray,
+        "start_minimized": s.start_minimized,
+    }
+
+
 def _state(st: Status) -> dict[str, str]:
     stalled = st.running and st.heartbeat and time.monotonic() - st.heartbeat > STALL_S
     if st.error:
@@ -282,9 +305,9 @@ class DimmerApp:
             TITLE,
             url=str(web_dir() / "index.html"),
             js_api=self.api,
-            width=640,
-            height=860,
-            min_size=(460, 560),
+            width=580,
+            height=820,
+            min_size=(440, 480),
             hidden=start_hidden,
             background_color="#1c1c1c",
         )

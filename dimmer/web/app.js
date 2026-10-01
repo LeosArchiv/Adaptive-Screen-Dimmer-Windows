@@ -14,7 +14,13 @@ let pending = {};
 let sendTimer = null;
 const monitorEls = new Map();
 
+const GLARE_LOCAL = 3;
+const MARGINS = ["Eng", "Normal", "Weit"];
+
 const pct = (v) => Math.round((v / 255) * 100);
+
+// Fields the backend does not know yet still get sensible values on screen.
+const withDefaults = (p) => ({ glare_contrast: 6, glare_strength: 75, glare_margin: 1, glare_fade_ms: 300, ...state.defaults, ...p });
 
 /* ---- sending ------------------------------------------------------------------------------------ */
 function queueProfile(changes) {
@@ -30,7 +36,7 @@ async function flushProfile() {
   if (!Object.keys(changes).length) return;
   const stored = await api.set_profile(changes);
   if (!Object.keys(pending).length) {  // no newer edits in flight: show what was really stored
-    profile = stored;
+    profile = withDefaults(stored);
     renderProfile();
   }
 }
@@ -87,6 +93,14 @@ function renderProfile(skip) {
   setSeg("attack", p.attack);
   setSeg("release", p.release);
   setSeg("glare", state.choices.glare[p.glare]);
+  $("glare-local").hidden = p.glare !== GLARE_LOCAL;
+  if (skip !== "glare_contrast") setRange("glare_contrast", p.glare_contrast);
+  if (skip !== "glare_strength") setRange("glare_strength", p.glare_strength);
+  if (skip !== "glare_fade_ms") setRange("glare_fade_ms", p.glare_fade_ms);
+  $("glare_contrast-out").textContent = `${p.glare_contrast}× heller`;
+  $("glare_strength-out").textContent = `${p.glare_strength} %`;
+  $("glare_fade_ms-out").textContent = `${(p.glare_fade_ms / 1000).toFixed(p.glare_fade_ms % 100 ? 2 : 1).replace(".", ",")} s`;
+  setSeg("glare_margin", MARGINS[p.glare_margin]);
 
   $("tint_on").checked = p.tint_on;
   $("tint-group").classList.toggle("off", !p.tint_on);
@@ -129,6 +143,10 @@ function setup() {
   bindRange("max", (v) => ({ max_opacity: Math.round((v / 100) * 255) }));
   bindRange("kelvin", (v) => ({ tint_kelvin: v }));
   bindRange("strength", (v) => ({ tint_strength: v }));
+  bindRange("glare_contrast", (v) => ({ glare_contrast: v }));
+  bindRange("glare_strength", (v) => ({ glare_strength: v }));
+  bindRange("glare_fade_ms", (v) => ({ glare_fade_ms: v }));
+  buildSeg("glare_margin", MARGINS, (v) => { queueProfile({ glare_margin: MARGINS.indexOf(v) }); renderProfile(); });
 
   buildSeg("attack", c.attack, (v) => { queueProfile({ attack: v }); renderProfile(); });
   buildSeg("release", c.release, (v) => { queueProfile({ release: v }); renderProfile(); });
@@ -152,12 +170,15 @@ function setup() {
     renderRunning(paused);
   });
   $("identify").addEventListener("click", () => api.identify());
-  $("reset").addEventListener("click", async () => {
-    pending = {};
-    clearTimeout(sendTimer);
-    profile = await api.reset_profile();
-    renderProfile();
-  });
+  for (const btn of document.querySelectorAll("[data-reset]")) {
+    btn.addEventListener("click", async () => {
+      await flushProfile();  // edits still waiting must not overwrite the reset afterwards
+      const res = await api.reset_section(btn.dataset.reset);
+      profile = withDefaults(res.profile);
+      renderProfile();
+      renderOptions(res.options);
+    });
+  }
 
   renderProfile();
   renderOptions(state.options);
@@ -265,7 +286,7 @@ document.addEventListener("contextmenu", (e) => e.preventDefault());
 window.addEventListener("pywebviewready", async () => {
   api = window.pywebview.api;
   state = await api.get_state();
-  profile = state.profile;
+  profile = withDefaults(state.profile);
   setup();
   $("app").hidden = false;
   poll();

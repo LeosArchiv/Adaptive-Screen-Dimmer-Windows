@@ -3,8 +3,8 @@ import pytest
 
 from dimmer.logic import (
     ATTACK_PRESETS,
-    LOCAL_MAX_ALPHA,
     RELEASE_PRESETS,
+    LocalParams,
     Smoother,
     blend_mask,
     brightness,
@@ -255,7 +255,7 @@ def test_local_mask_darkens_only_the_spot() -> None:
     means = tile_means(tile_sums(img), 1920, 1080)
     mask = local_mask(means, st.background, None, 0.05)
     spot_tile = mask[180 // 16, 1680 // 16]
-    assert 0.5 < spot_tile <= LOCAL_MAX_ALPHA  # 255 -> about the cap (96) -> alpha ~0.62
+    assert 0.5 < spot_tile <= LocalParams().max_alpha  # 255 -> about the cap (96) -> alpha ~0.62
     assert mask[600 // 16, 600 // 16] == 0.0  # the dark rest of the picture stays untouched
     assert mask[50 // 16, 50 // 16] == 0.0
 
@@ -290,3 +290,25 @@ def test_mask_target_is_kept_while_the_picture_does_not_change() -> None:
     for _ in range(100):
         mask = blend_mask(target, mask, 0.05)
     assert mask[180 // 16, 1680 // 16] > 0.5
+
+
+def test_local_settings_change_the_mask() -> None:
+    img = dark_scene()
+    st = frame_stats(tile_sums(img), 1920, 1080)
+    means = tile_means(tile_sums(img), 1920, 1080)
+    normal = local_target(means, st.background)
+    weak = local_target(means, st.background, LocalParams(max_alpha=0.3))
+    tight = local_target(means, st.background, LocalParams(margin=0))
+    wide = local_target(means, st.background, LocalParams(margin=2))
+    assert weak.max() <= 0.3 + 1e-6 < normal.max()
+    assert (tight > 0).sum() < (normal > 0).sum() < (wide > 0).sum()
+    # less sensitive: a spot only six times brighter than the background is no longer touched
+    assert local_target(means, st.background, LocalParams(contrast=12)).max() <= normal.max()
+
+
+def test_local_fade_time() -> None:
+    mask = np.full((4, 4), 0.6, np.float32)
+    zero = np.zeros((4, 4), np.float32)
+    quick = blend_mask(zero, mask, 0.3, release_s=0.1)
+    slow = blend_mask(zero, mask, 0.3, release_s=1.5)
+    assert quick.max() < slow.max()
