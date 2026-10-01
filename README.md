@@ -1,94 +1,112 @@
 # Adaptive Screen Dimmer (Windows)
 
-Automatically dims your screen when content gets too bright (a white web page popping up in a
-dark IDE, a flash in a game or video) to reduce eye strain and flash blindness. Lightweight,
-click-through, multi-monitor, and designed never to flicker.
+Dunkelt den Bildschirm automatisch ab, sobald er zu hell wird: eine weiße Webseite in einer
+dunklen Umgebung, ein Blitz im Spiel, eine Taschenlampe im dunklen Film. Das schont die Augen
+und blendet nicht. Läuft leise im Hintergrund, auf beliebig vielen Monitoren, ohne zu flackern.
 
-## Features
-- 🛡️ **Flash protection without flicker**: darkens quickly as a soft ramp, brightens again slowly
-  after a short hold, and ignores tiny changes, so strobing content does not make it pump.
-- ⚡ **GPU capture, near-zero CPU**: Windows.Graphics.Capture delivers frames only when the screen
-  changes; a D3D11 compute shader reduces each frame to exact per-tile sums, so no image data is
-  copied to the CPU. A flash is seen within ~2 display frames. Automatic GDI fallback.
-- 🎯 **Accurate measurement**: the overlays are excluded from capture, so they never measure
-  themselves; brightness is the exact mean over every pixel (no aliasing on text while scrolling).
-- 🔦 **Glare protection** ("Helle Flecken"): a small very bright area in a dark picture (a
-  flashlight in a dark film scene) is detected by its contrast to the background. *normal/stark*
-  dim the whole screen, *lokal* darkens **only the glaring area** with a soft GPU-drawn mask.
-- 🖥️ **Any number of monitors**: pick them by checkbox with live brightness meters; monitor
-  choice survives reboots and re-plugging; hot-plug and resolution changes are handled.
-- ⏸ **Pause anywhere**: global hotkey **Ctrl+Alt+D**, tray icon menu, or the big button.
-- 🎛️ **One profile**: a single set of values for all monitors, tuned live while you watch the
-  meters.
-- 🌅 **Blue-light filter** on every monitor via the display's gamma ramp: colour temperature and
-  strength, optionally only at night between two times.
-- 🌙 **Runs in the background**: tray icon (grey while paused), close-to-tray, start minimized.
-- ⚙️ **Live settings**, saved automatically to `%APPDATA%\AdaptiveScreenDimmer\settings.json`.
+## Was er kann
 
-## Quick Start
-We do not ship prebuilt binaries. Python 3.10+ is required. The window uses the Edge WebView2
-runtime that is part of Windows 11 (on Windows 10 it may need the free WebView2 runtime).
+- **Abdunkeln ohne Flackern.** Wird es hell, dunkelt er weich und schnell ab. Heller wird es erst
+  nach einer kurzen Pause und langsam. Kleine Schwankungen ignoriert er, damit nichts pumpt.
+- **Helle Flecken.** Eine kleine, sehr helle Stelle in einem dunklen Bild wird über ihren
+  Kontrast zur Umgebung erkannt. Mit „Lokal“ wird nur diese Stelle abgedunkelt, der Rest des
+  Bildes bleibt, wie er ist.
+- **Blaulichtfilter.** Macht Weiß wärmer, auch auf externen Monitoren. Schwarz bleibt schwarz,
+  weil der Filter direkt die Farbkurve des Monitors ändert und keine Farbschicht über das Bild
+  legt. Auf Wunsch nur nachts.
+- **Wenig Last.** Die Helligkeit wird auf der Grafikkarte gemessen, und nur wenn sich das Bild
+  ändert. Im Leerlauf braucht die App etwa 1 % CPU.
+- **Ein Profil für alles.** Alle Regler wirken sofort, so lässt sich alles direkt am Bild
+  einstellen.
+- **Pause jederzeit** mit Strg+Alt+D, über das Symbol im Infobereich oder den Schalter im Fenster.
 
-### Option A: Build the EXE
+## Starten
+
+Fertige Programmdateien gibt es nicht, du baust die EXE selbst. Dafür braucht es Python 3.10
+oder neuer. Das Fenster nutzt WebView2, das in Windows 11 schon enthalten ist (für Windows 10
+gibt es die WebView2 Runtime kostenlos bei Microsoft). Administratorrechte sind nicht nötig.
+
+EXE bauen:
 ```powershell
 ./build_exe.bat
 ```
-Creates `dist\AdaptiveScreenDimmer.exe` (runs without Python) and smoke-tests it.
+Danach liegt `dist\AdaptiveScreenDimmer.exe` bereit. Sie läuft ohne Python und wird beim Bauen
+kurz testweise gestartet.
 
-### Option B: Run from source
+Ohne EXE direkt aus dem Quellcode:
 ```powershell
 py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 .\adaptive_dimmer_START.bat
 ```
-No administrator rights are needed.
 
-## Usage
-One window, top to bottom:
+## Bedienung
 
-- **Header**: the big switch pauses and resumes (same as Ctrl+Alt+D), the line below shows the state.
-- **Bildschirme**: per monitor a live meter. The bar is the current picture brightness (white
-  marker), the amber line below shows where dimming starts and where it reaches full strength.
-  Next to it the current dimming and filter in percent, and a switch to dim that monitor or not.
-  "Nummern zeigen" flashes the number of each monitor on screen.
-- **Abdunkeln**: Beginn, Volle Stärke ab, Stärkste Abdunkelung (capped at 94 %, never black),
-  and how fast it gets darker and brighter again.
-- **Helle Flecken**: Aus, Normal, Stark (whole screen) or Lokal (only the glaring area). With
-  Lokal: Empfindlichkeit (how many times brighter than the surroundings a spot has to be),
-  Stärke, Rand (Eng, Normal, Weit) and Ausblenden (how slowly the darkening disappears).
-- **Blaulichtfilter**: on or off, colour temperature (lower is warmer), strength up to 60 %, and
-  "Nur nachts" with two times.
-- **Optionen**: Messrate (Sparsam 10/s, Normal 20/s, Schnell 30/s while the screen changes, half
-  when it is still), hotkey, start paused, close to tray, start minimized. Below that the log.
-- Every section has a "Standardwerte" button that resets only that section.
+- **Oben:** Der große Schalter pausiert und setzt fort, darunter steht der Zustand.
+- **Bildschirme:** Für jeden Monitor eine Live-Anzeige. Der weiße Strich zeigt die aktuelle
+  Bildhelligkeit, die orange Linie zeigt, wo das Abdunkeln beginnt und wo es voll greift.
+  Daneben Abdunkelung und Filter in Prozent und ein Schalter, ob der Monitor mitmacht.
+  „Nummern zeigen“ blendet kurz die Nummer auf jedem Monitor ein.
+- **Abdunkeln:** Beginn, Volle Stärke ab, Stärkste Abdunkelung (höchstens 94 %, nie ganz
+  schwarz), und wie schnell es dunkler und wieder heller wird.
+- **Helle Flecken:** Aus, Normal, Stark (ganzer Bildschirm) oder Lokal (nur die grelle Stelle).
+  Bei Lokal zusätzlich:
+  - Empfindlichkeit: wie viel heller als die Umgebung eine Stelle sein muss.
+  - Stärke: wie stark ein Fleck höchstens abgedunkelt wird.
+  - Rand: Eng, Normal oder Weit.
+  - Ausblenden: wie lange die Abdunkelung braucht, bis sie weg ist.
+- **Blaulichtfilter:** an oder aus, Farbtemperatur (weniger Kelvin ist wärmer), Stärke bis 60 %
+  und „Nur nachts“ mit zwei Uhrzeiten.
+- **Optionen:** Messrate, Tastenkürzel, pausiert starten, Schließen blendet nur aus, minimiert
+  starten. Darunter das Protokoll.
 
-Every change applies at once and is saved automatically.
-Command line: `--paused`, `--exit-after SEC` (quits automatically), `--verbose`.
-Log file: `%APPDATA%\AdaptiveScreenDimmer\dimmer.log`.
+Jeder Abschnitt hat einen Knopf „Standardwerte“, der nur diesen Abschnitt zurücksetzt. Alle
+Änderungen werden sofort gespeichert, in `%APPDATA%\AdaptiveScreenDimmer\settings.json`.
+Das Protokoll liegt daneben in `dimmer.log`.
 
-## Limits
-- Exclusive-fullscreen games (old DirectX titles) draw above every window; no overlay can cover
-  them. Borderless/windowed fullscreen works.
-- Protected screens (UAC prompt, lock screen) cannot be measured; the last state is kept.
-- DRM-protected video is blanked in screen captures: brightness and glare there cannot be
-  measured. Local files (VLC, mpv, …) are not affected.
-- Local dimming lags the picture by about two display frames; fast-moving lights can briefly
-  show an uncovered edge. It needs GPU capture (Windows 10 2004+ with a D3D11 GPU).
-- Windows 10 2004 or newer is needed to exclude the overlay from capture; older versions fall
-  back to a mathematical compensation.
+Optionen beim Start: `--paused` (pausiert starten), `--exit-after SEK` (beendet sich nach so
+vielen Sekunden), `--verbose` (ausführliches Protokoll).
 
-## Development
+## Grenzen
+
+- Spiele im exklusiven Vollbild (ältere DirectX-Titel) liegen über jedem Fenster, dort kann
+  nichts abdunkeln. Randloses Fenster oder Fenstermodus funktioniert.
+- Geschützte Bildschirme (Benutzerkontensteuerung, Sperrbildschirm) lassen sich nicht messen.
+  Dort bleibt der letzte Zustand.
+- Kopiergeschützte Videos (etwa Netflix im Browser) erscheinen in der Bildschirmaufnahme schwarz
+  und lassen sich deshalb nicht messen. YouTube und lokale Dateien betrifft das nicht.
+- Helle Flecken werden in Kacheln von 16 × 16 Pixeln gemessen. Ab etwa 20 bis 30 Pixeln wird ein
+  Fleck sicher erkannt, sehr kleine Punkte und dünne Linien nur teilweise.
+- Die lokale Abdunkelung hängt etwa zwei Bilder hinter dem Bild her. Bei sehr schnellen Lichtern
+  kann kurz ein Rand durchblitzen, „Rand: Weit“ hilft dagegen.
+
+## Entwicklung
+
 ```powershell
 .venv\Scripts\python -m pip install -r requirements-dev.txt
-.\tools\check.ps1          # ruff, format, mypy, unit tests
-.\tools\check.ps1 -Live    # + overlay lifecycle tests (real windows, never visibly dimming)
-.\tools\check.ps1 -Build   # + EXE build with smoke test
-.venv\Scripts\python tools\bench_live.py --monitor 0   # latency/CPU with a synthetic flash
+.\tools\check.ps1          # ruff, Formatierung, mypy, Tests
+.\tools\check.ps1 -Live    # zusätzlich Tests mit echten, unsichtbaren Overlays
+.\tools\check.ps1 -Build   # zusätzlich EXE bauen und kurz starten
+.venv\Scripts\python tools\bench_live.py --monitor 0   # Reaktionszeit und CPU mit künstlichem Blitz
 ```
-Architecture: `dimmer/logic.py` (pure measurement and smoothing), `profiles.py` (pure profile
-and night time logic), `gpu.py` (D3D11 tile reduction), `wgc.py` (Windows.Graphics.Capture),
-`localdim.py` (DirectComposition mask layer), `winapi.py` (monitors, GDI capture, apps per monitor), `overlay.py`, `engine.py` (one thread owns all windows), `gui.py` with the page in `dimmer/web`
-(pywebview), `tray.py`, `app.py`. `tools\gui_snapshot.py out.png` saves a picture of the window.
+`bench_live.py` zeichnet das Testbild mit tkinter und braucht dafür ein Python mit tkinter.
+`tools\gui_snapshot.py out.png` speichert ein Bild des Fensters.
 
-## License
-MIT License, see [LICENSE](LICENSE).
+Aufbau des Codes in `dimmer/`:
+
+| Datei | Aufgabe |
+| --- | --- |
+| `logic.py` | Messung, Glättung, Helle Flecken (ohne Windows-Abhängigkeiten) |
+| `profiles.py` | das Profil und die Nachtzeit |
+| `settings.py` | Einstellungen laden und speichern |
+| `engine.py` | ein Thread steuert Messung und alle Overlay-Fenster |
+| `gpu.py`, `wgc.py` | Aufnahme mit Windows.Graphics.Capture, Auswertung auf der Grafikkarte |
+| `localdim.py` | Maske für die lokale Abdunkelung (DirectComposition) |
+| `gamma.py` | Blaulichtfilter über die Farbkurve des Monitors |
+| `overlay.py`, `winapi.py` | Overlay-Fenster, Monitore, GDI-Aufnahme als Rückfallebene |
+| `gui.py`, `web/` | Fenster mit pywebview |
+| `tray.py`, `app.py` | Symbol im Infobereich, Programmstart |
+
+## Lizenz
+
+MIT, siehe [LICENSE](LICENSE).
