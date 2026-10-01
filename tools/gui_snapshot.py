@@ -2,7 +2,7 @@
 
 Uses a throw-away config directory and quits after a few seconds (kill switch included).
 
-    python tools/gui_snapshot.py out.png [--scroll PX] [--paused] [--open-log]
+    python tools/gui_snapshot.py out.png [--scroll PX] [--paused] [--open-log] [--language de|en]
 """
 
 from __future__ import annotations
@@ -79,6 +79,7 @@ def main() -> None:
     ap.add_argument("--delay", type=float, default=4.0)
     ap.add_argument("--scroll", type=int, default=0, help="scroll the page down by this many pixels")
     ap.add_argument("--open-log", action="store_true")
+    ap.add_argument("--language", choices=("auto", "de", "en"), default="auto")
     args = ap.parse_args()
     threading.Timer(args.delay + 15, lambda: os._exit(3)).start()  # kill switch
     os.environ["ASD_CONFIG_DIR"] = tempfile.mkdtemp(prefix="asd-snap-")
@@ -92,6 +93,7 @@ def main() -> None:
     handler = app._setup_logging(False)
     s = settings_mod.load()
     s.start_paused = args.paused
+    s.language = args.language
     engine = Engine(s)
     engine.start()
     ui = DimmerApp(engine, s, handler, None)

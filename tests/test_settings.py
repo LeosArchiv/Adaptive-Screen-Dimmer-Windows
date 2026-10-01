@@ -122,3 +122,12 @@ def test_wanted_devices_keeps_connected_choice() -> None:
 def test_wanted_devices_falls_back_when_choice_unplugged() -> None:
     mons = [_mon("a", True)]
     assert wanted_devices(["gone"], mons) == ["a"]
+
+
+def test_language_is_kept_and_validated() -> None:
+    from dimmer.settings import Settings, from_dict
+
+    assert Settings().language == "auto"
+    assert from_dict({"version": 3, "profile": {}, "language": "en"}).language == "en"
+    assert from_dict({"version": 3, "profile": {}, "language": "fr"}).language == "auto"
+    assert from_dict({"version": 2, "language": "de"}).language == "de"

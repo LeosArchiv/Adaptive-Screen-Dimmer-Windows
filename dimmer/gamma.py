@@ -59,7 +59,7 @@ class GammaTint:
             return True
         if not self._set(build_ramp(factors)):
             if key != (1.0, 1.0, 1.0):
-                log.info("%s: Farbfilter über Gamma nicht möglich, Overlay wird genutzt", self.device)
+                log.info("%s: gamma ramp refused, using the colour overlay", self.device)
                 self.failed = True
             return False
         self._key = key  # type: ignore[assignment]

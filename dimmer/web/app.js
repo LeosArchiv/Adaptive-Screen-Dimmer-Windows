@@ -15,7 +15,8 @@ let sendTimer = null;
 const monitorEls = new Map();
 
 const GLARE_LOCAL = 3;
-const MARGINS = ["Eng", "Normal", "Weit"];
+const segLabels = new Map();  // seg id -> function value -> label, for relabelling on a language switch
+let lastPaused = false;
 
 const pct = (v) => Math.round((v / 255) * 100);
 
@@ -56,19 +57,30 @@ function bindRange(id, toProfile) {
   });
 }
 
-function buildSeg(id, names, onPick) {
+function buildSeg(id, values, label, onPick) {
   const el = $(id);
-  el.replaceChildren(...names.map((name) => {
+  segLabels.set(id, label);
+  el.replaceChildren(...values.map((value) => {
     const b = document.createElement("button");
     b.type = "button";
-    b.textContent = name;
-    b.addEventListener("click", () => onPick(name));
+    b.dataset.value = String(value);
+    b.textContent = label(value);
+    b.addEventListener("click", () => onPick(value));
     return b;
   }));
 }
 
+function relabelSegs() {
+  for (const [id, label] of segLabels) {
+    for (const b of $(id).children) {
+      const raw = b.dataset.value;
+      b.textContent = label(/^\d+$/.test(raw) ? Number(raw) : raw);
+    }
+  }
+}
+
 function setSeg(id, value) {
-  for (const b of $(id).children) b.setAttribute("aria-pressed", String(b.textContent === value));
+  for (const b of $(id).children) b.setAttribute("aria-pressed", String(b.dataset.value === String(value)));
 }
 
 function setRange(id, value) {
@@ -92,15 +104,15 @@ function renderProfile(skip) {
   $("max-out").textContent = `${Math.round((p.max_opacity / 255) * 100)} %`;
   setSeg("attack", p.attack);
   setSeg("release", p.release);
-  setSeg("glare", state.choices.glare[p.glare]);
+  setSeg("glare", p.glare);
   $("glare-local").hidden = p.glare !== GLARE_LOCAL;
   if (skip !== "glare_contrast") setRange("glare_contrast", p.glare_contrast);
   if (skip !== "glare_strength") setRange("glare_strength", p.glare_strength);
   if (skip !== "glare_fade_ms") setRange("glare_fade_ms", p.glare_fade_ms);
-  $("glare_contrast-out").textContent = `${p.glare_contrast}× heller`;
+  $("glare_contrast-out").textContent = tr("brighter", { n: p.glare_contrast });
   $("glare_strength-out").textContent = `${p.glare_strength} %`;
-  $("glare_fade_ms-out").textContent = `${(p.glare_fade_ms / 1000).toFixed(p.glare_fade_ms % 100 ? 2 : 1).replace(".", ",")} s`;
-  setSeg("glare_margin", MARGINS[p.glare_margin]);
+  $("glare_fade_ms-out").textContent = `${(p.glare_fade_ms / 1000).toFixed(p.glare_fade_ms % 100 ? 2 : 1).replace(".", tr("decimal"))} s`;
+  setSeg("glare_margin", p.glare_margin);
 
   $("tint_on").checked = p.tint_on;
   $("tint-group").classList.toggle("off", !p.tint_on);
@@ -121,6 +133,16 @@ function renderProfile(skip) {
 function renderOptions(o) {
   setSeg("rate", o.rate);
   for (const id of ["hotkey", "start_paused", "close_to_tray", "start_minimized"]) $(id).checked = o[id];
+  setSeg("language", o.language);
+}
+
+function applyLanguage(lang) {
+  LANG = lang;
+  translatePage();
+  relabelSegs();
+  renderProfile();
+  renderRunning(lastPaused);
+  renderMonitors(lastMonitors);
 }
 
 function setup() {
@@ -146,12 +168,16 @@ function setup() {
   bindRange("glare_contrast", (v) => ({ glare_contrast: v }));
   bindRange("glare_strength", (v) => ({ glare_strength: v }));
   bindRange("glare_fade_ms", (v) => ({ glare_fade_ms: v }));
-  buildSeg("glare_margin", MARGINS, (v) => { queueProfile({ glare_margin: MARGINS.indexOf(v) }); renderProfile(); });
-
-  buildSeg("attack", c.attack, (v) => { queueProfile({ attack: v }); renderProfile(); });
-  buildSeg("release", c.release, (v) => { queueProfile({ release: v }); renderProfile(); });
-  buildSeg("glare", c.glare, (v) => { queueProfile({ glare: c.glare.indexOf(v) }); renderProfile(); });
-  buildSeg("rate", c.rate, (v) => { setSeg("rate", v); api.set_option("rate", v); });
+  const pick = (field) => (v) => { queueProfile({ [field]: v }); renderProfile(); };
+  buildSeg("glare_margin", [0, 1, 2], (v) => choiceLabel("margin", v), pick("glare_margin"));
+  buildSeg("attack", c.attack, (v) => choiceLabel("attack", v), pick("attack"));
+  buildSeg("release", c.release, (v) => choiceLabel("release", v), pick("release"));
+  buildSeg("glare", [0, 1, 2, 3], (v) => choiceLabel("glare", v), pick("glare"));
+  buildSeg("rate", c.rate, (v) => choiceLabel("rate", v), (v) => { setSeg("rate", v); api.set_option("rate", v); });
+  buildSeg("language", Object.keys(LANGUAGE_CHOICES), (v) => LANGUAGE_CHOICES[v], async (v) => {
+    setSeg("language", v);
+    applyLanguage(await api.set_option("language", v));
+  });
 
   $("tint_on").addEventListener("change", (e) => { queueProfile({ tint_on: e.target.checked }); renderProfile(); });
   $("tint_night_only").addEventListener("change", (e) => {
@@ -186,8 +212,9 @@ function setup() {
 
 /* ---- live status -------------------------------------------------------------------------------- */
 function renderRunning(paused) {
+  lastPaused = paused;
   $("running").checked = !paused;
-  $("running-label").textContent = paused ? "Pausiert" : "An";
+  $("running-label").textContent = tr(paused ? "paused" : "on");
 }
 
 function monitorEl(m) {
@@ -196,6 +223,7 @@ function monitorEl(m) {
   el = $("monitor-tpl").content.firstElementChild.cloneNode(true);
   const box = el.querySelector("input");
   box.addEventListener("change", () => api.set_monitor_enabled(m.device, box.checked));
+  for (const t of el.querySelectorAll("[data-t]")) t.textContent = tr(t.dataset.t);
   monitorEls.set(m.device, el);
   return el;
 }
@@ -225,10 +253,10 @@ function renderMonitors(list) {
     const el = order[i];
     el.classList.toggle("off", !m.active);
     el.querySelector(".mon-num").textContent = m.number;
-    el.querySelector(".mon-title").textContent = m.primary ? "Hauptbildschirm" : `Bildschirm ${m.number}`;
+    el.querySelector(".mon-title").textContent = m.primary ? tr("main_display") : tr("display_n", { n: m.number });
     const meta = [m.size];
-    if (m.active && m.capture) meta.push(`Messung per ${m.capture}`);
-    if (!m.active) meta.push("nicht gedimmt");
+    if (m.active && m.capture) meta.push(tr("measured_by", { c: m.capture }));
+    if (!m.active) meta.push(tr("not_dimmed"));
     el.querySelector(".mon-meta").textContent = meta.join(", ");
     const input = el.querySelector("input");
     if (document.activeElement !== input) input.checked = m.enabled;
@@ -256,13 +284,13 @@ async function poll() {
     const s = await api.get_status();
     const st = $("status");
     st.dataset.kind = s.state.kind;
-    let text = s.state.text;
-    if (s.state.kind === "ok" && profile.tint_on) text += s.tint_now ? ", Blaulichtfilter an" : "";
+    let text = tr(`state_${s.state.reason}`, { e: s.state.detail || "" });
+    if (s.state.kind === "ok" && profile.tint_on && s.tint_now) text += `, ${tr("tint_now")}`;
     $("status-text").textContent = text;
     renderRunning(s.paused);
-    $("hotkey-hint").textContent = $("hotkey").checked && !s.hotkey_ok ? "Kürzel ist schon belegt" : "";
+    $("hotkey-hint").textContent = $("hotkey").checked && !s.hotkey_ok ? tr("hotkey_taken") : "";
     $("night-hint").textContent = profile.tint_night_only
-      ? (s.tint_now ? "gerade aktiv" : `aktiv ab ${profile.night_start}`)
+      ? (s.tint_now ? tr("night_now") : tr("night_from", { t: profile.night_start }))
       : "";
     renderMonitors(s.monitors);
     appendLog(s.log);
@@ -287,6 +315,8 @@ window.addEventListener("pywebviewready", async () => {
   api = window.pywebview.api;
   state = await api.get_state();
   profile = withDefaults(state.profile);
+  LANG = state.lang;
+  translatePage();
   setup();
   $("app").hidden = false;
   poll();

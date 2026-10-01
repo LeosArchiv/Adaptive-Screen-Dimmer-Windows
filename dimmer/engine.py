@@ -249,14 +249,14 @@ class _Slot:
             self.forget_frame()
             self.computed_for = None
             self.wgc_failures = 0
-            (log.debug if quiet else log.info)("%s: GPU-Aufnahme (Windows.Graphics.Capture)", self.monitor.gdi_name)
+            (log.debug if quiet else log.info)("%s: GPU capture (Windows.Graphics.Capture)", self.monitor.gdi_name)
         except Exception as e:
             self.capture = None
             self.wgc_failures += 1
             self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
             # warn once; later retries of the same problem go to the debug log only
             (log.debug if quiet or self.wgc_failures > 1 else log.warning)(
-                "%s: GPU-Aufnahme nicht möglich (%s), GDI wird genutzt", self.monitor.gdi_name, e
+                "%s: GPU capture not available (%s), using GDI", self.monitor.gdi_name, e
             )
 
     def stop_gpu_capture(self) -> None:
@@ -283,7 +283,7 @@ class _Slot:
                 if self.capture.submissions != submitted:
                     self.processed_at = now  # the measuring slot starts with the submission
             except Exception as e:
-                log.warning("%s: GPU-Aufnahme fehlgeschlagen (%s), wechsle zu GDI", self.monitor.gdi_name, e)
+                log.warning("%s: GPU capture failed (%s), switching to GDI", self.monitor.gdi_name, e)
                 self.stop_gpu_capture()
                 self.wgc_retry_at = time.monotonic() + WGC_RETRY_S
             else:
@@ -437,7 +437,7 @@ class _Slot:
             if not self.local.show_mask(mask):
                 self._mask_moving = True  # not presented yet: try again next round
         except Exception as e:
-            log.warning("%s: lokales Abdunkeln nicht möglich (%s)", self.monitor.gdi_name, e)
+            log.warning("%s: local dimming not available (%s)", self.monitor.gdi_name, e)
             self.stop_local()
             self.local_failed = True
             self.local_retry_at = time.monotonic() + WGC_RETRY_S
@@ -461,7 +461,7 @@ class _Slot:
         if layer.visible:
             self.local_hidden_at = None
             if not layer.alive():
-                log.info("%s: Composition-Gerät verloren, lokale Ebene wird neu aufgebaut", self.monitor.gdi_name)
+                log.info("%s: composition device lost, rebuilding the local layer", self.monitor.gdi_name)
                 self.stop_local()
         elif self.local_hidden_at is None:
             self.local_hidden_at = time.monotonic()
@@ -524,8 +524,8 @@ def wanted_devices(chosen: list[str], monitors: list[Monitor]) -> list[str]:
 
 
 def monitor_label(m: Monitor, index: int) -> str:
-    text = f"Bildschirm {index + 1} · {m.width}×{m.height}"
-    return text + " (Hauptbildschirm)" if m.primary else text
+    text = f"Monitor {index + 1} · {m.width}×{m.height}"
+    return text + " (primary)" if m.primary else text
 
 
 class Engine(threading.Thread):
@@ -614,7 +614,7 @@ class Engine(threading.Thread):
                 self._refresh_monitors()
                 self._monitors_dirty = False
             except Exception:  # the loop retries; a vanishing monitor must not end the engine
-                log.exception("Bildschirme konnten beim Start nicht gelesen werden")
+                log.exception("Could not read the monitors at startup")
             with self._lock:
                 self._status.running = True
             self._ready.set()
@@ -678,7 +678,7 @@ class Engine(threading.Thread):
                         slot.check_local()
                     next_topmost = now + TOPMOST_REFRESH_S
                 if failures:
-                    log.info("Messschleife läuft wieder")
+                    log.info("Measuring loop recovered")
                     failures, last_error = 0, ""
                     with self._lock:
                         self._status.error = None
@@ -689,7 +689,7 @@ class Engine(threading.Thread):
                 failures += 1
                 error = f"{type(e).__name__}: {e}"
                 if error != last_error:  # full traceback once per distinct error, not every 2 s
-                    log.exception("Fehler in der Messschleife")
+                    log.exception("Error in the measuring loop")
                     last_error = error
                 with self._lock:
                     self._status.error = error
@@ -735,12 +735,12 @@ class Engine(threading.Thread):
             self._gpu = _GpuContext()
         except Exception as e:
             self._gpu = None
-            log.warning("GPU-Aufnahme nicht verfügbar (%s), GDI wird genutzt", e)
+            log.warning("GPU capture not available (%s), using GDI", e)
 
     def _retry_gpu_captures(self) -> None:
         """Rebuild a lost GPU device, restart dead or stale captures, retry fallen-back monitors."""
         if self._gpu is not None and self._gpu.gpu.is_lost():
-            log.warning("Grafikkarte zurückgesetzt, GPU-Aufnahme wird neu aufgebaut")
+            log.warning("Graphics device was reset, rebuilding GPU capture")
             self._restart_gpu()
             return
         now = time.monotonic()
@@ -888,7 +888,7 @@ class Engine(threading.Thread):
         if slot.capture_failures % CAPTURE_RENEW_AFTER == 0:
             # Persistent failure (not just a short UAC prompt): get a fresh screen DC and, so a
             # stale dark overlay cannot linger unnoticed, fade it out until capture works again.
-            log.warning("Bildschirm %s kann nicht gemessen werden", slot.monitor.gdi_name)
+            log.warning("Monitor %s cannot be measured", slot.monitor.gdi_name)
             slot.target = 0.0
             slot.renew_sampler()
 
@@ -955,7 +955,7 @@ class Engine(threading.Thread):
     def _set_paused(self, paused: bool) -> None:
         if paused != self._paused:
             self._paused = paused
-            log.info("Pausiert" if paused else "Fortgesetzt")
+            log.info("Paused" if paused else "Resumed")
             for slot in self._slots.values():
                 slot.computed_for = None  # the target must be recomputed, even without a new frame
         self._wake_now = True
@@ -968,7 +968,7 @@ class Engine(threading.Thread):
         effective = resolve(self._settings.profile, minute)
         for slot in self._slots.values():
             if effective.tint_on != slot.effective.tint_on:
-                log.info("%s: Blaulichtfilter %s", slot.monitor.gdi_name, "an" if effective.tint_on else "aus")
+                log.info("%s: blue light filter %s", slot.monitor.gdi_name, "on" if effective.tint_on else "off")
             if effective != slot.effective:
                 old = slot.effective
                 slot.effective = effective
@@ -985,7 +985,7 @@ class Engine(threading.Thread):
         if not force and monitors == self._monitors:
             return
         if monitors != self._monitors:
-            log.info("Bildschirme erkannt: %s", ", ".join(f"{m.gdi_name} {m.width}x{m.height}" for m in monitors))
+            log.info("Monitors found: %s", ", ".join(f"{m.gdi_name} {m.width}x{m.height}" for m in monitors))
         wanted = set(wanted_devices(self._settings.monitors, monitors))
         by_device = {m.device: (i, m) for i, m in enumerate(monitors)}
         for device in list(self._slots):
@@ -1002,7 +1002,7 @@ class Engine(threading.Thread):
             self._slots[device] = slot
             self._resolve_profiles()
             if not slot.dim.excluded:
-                log.warning("Overlay kann nicht aus der Messung ausgenommen werden, Kompensation aktiv")
+                log.warning("Overlay cannot be excluded from capture, compensating")
         with self._lock:
             self._monitors = monitors
         self._publish()
@@ -1074,7 +1074,7 @@ class Engine(threading.Thread):
         if self._settings.hotkey:
             ok = bool(user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, HOTKEY_VK))
             if not ok:
-                log.warning("Tastenkürzel Strg+Alt+D ist bereits von einem anderen Programm belegt")
+                log.warning("Hotkey Ctrl+Alt+D is already used by another program")
         with self._lock:
             self._status.hotkey_ok = ok
 

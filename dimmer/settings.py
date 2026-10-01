@@ -13,7 +13,8 @@ from .profiles import Profile, clamp
 
 APP_NAME = "AdaptiveScreenDimmer"
 VERSION = 3
-GENERAL_KEYS = ("monitors", "interval_ms", "hotkey", "start_paused", "close_to_tray", "start_minimized")
+GENERAL_KEYS = ("monitors", "interval_ms", "hotkey", "start_paused", "close_to_tray", "start_minimized", "language")
+LANGUAGES = ("auto", "de", "en")
 
 
 def config_dir() -> Path:
@@ -33,6 +34,7 @@ class Settings:
     start_paused: bool = False
     close_to_tray: bool = True  # window close button hides to the notification area
     start_minimized: bool = False
+    language: str = "auto"  # "auto" follows the Windows display language
     version: int = VERSION
 
     def normalized(self) -> Settings:
@@ -45,6 +47,8 @@ class Settings:
         for name in ("hotkey", "start_paused", "close_to_tray", "start_minimized"):
             if not isinstance(getattr(s, name), bool):  # "false" as a string must not mean True
                 setattr(s, name, getattr(defaults, name))
+        if s.language not in LANGUAGES:
+            s.language = defaults.language
         s.version = VERSION
         return s
 
