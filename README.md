@@ -22,11 +22,14 @@ und blendet nicht. Läuft leise im Hintergrund, auf beliebig vielen Monitoren, o
 
 ## Starten
 
-Fertige Programmdateien gibt es nicht, du baust die EXE selbst. Dafür braucht es Python 3.10
-oder neuer. Das Fenster nutzt WebView2, das in Windows 11 schon enthalten ist (für Windows 10
-gibt es die WebView2 Runtime kostenlos bei Microsoft). Administratorrechte sind nicht nötig.
+Am einfachsten: `AdaptiveScreenDimmer.exe` unter
+[Releases](https://github.com/LeosArchiv/Adaptive-Screen-Dimmer-Windows/releases/latest)
+herunterladen und starten. Sie läuft ohne Installation und ohne Python. Administratorrechte sind
+nicht nötig. Das Fenster nutzt WebView2, das in Windows 11 schon enthalten ist (für Windows 10
+gibt es die WebView2 Runtime kostenlos bei Microsoft). Weil die EXE nicht signiert ist, kann
+Windows SmartScreen beim ersten Start warnen: „Weitere Informationen“, dann „Trotzdem ausführen“.
 
-EXE bauen:
+Selbst bauen (Python 3.10 oder neuer):
 ```powershell
 ./build_exe.bat
 ```
