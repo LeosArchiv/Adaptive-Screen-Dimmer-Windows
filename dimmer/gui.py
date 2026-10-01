@@ -346,7 +346,9 @@ class DimmerApp:
         if self._quitting:
             return True
         if self.tray and self.tray.is_alive() and self.api.current_settings().close_to_tray:
-            self.hide_window()
+            # Hide only after the closing event has finished: hiding from inside the handler
+            # leaves the window in a state where a later destroy() never returns (tray "Quit").
+            threading.Thread(target=self.hide_window, name="ui-hide", daemon=True).start()
             return False
         self._quitting = True
         self.api.flush()
@@ -366,6 +368,7 @@ class DimmerApp:
             return
         self._quitting = True
         self.api.flush()
+        log.debug("quit: closing the window")
         self.window.destroy()
 
     def identify(self) -> None:
