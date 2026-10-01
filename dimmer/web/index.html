@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adaptive Screen Dimmer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="app" id="app" hidden>
+  <header class="top">
+    <div class="brand">
+      <h1>Screen Dimmer</h1>
+      <p class="status" id="status"><span class="dot"></span><span id="status-text">Startet</span></p>
+    </div>
+    <label class="power" title="Strg+Alt+D">
+      <input type="checkbox" id="running" role="switch">
+      <span class="power-track"><span class="power-thumb"></span></span>
+      <span class="power-label" id="running-label">An</span>
+    </label>
+  </header>
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Bildschirme</h2>
+      <button class="btn subtle" id="identify" type="button">Nummern zeigen</button>
+    </div>
+    <div id="monitors" class="monitors"></div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Abdunkeln</h2>
+      <button class="btn subtle" data-reset="dim" type="button">Standardwerte</button>
+    </div>
+    <div class="group">
+      <div class="row">
+        <div class="row-label"><span>Beginn</span><small>ab hier wird gedimmt</small></div>
+        <div class="row-ctl slider"><input type="range" id="start" min="0" max="250"><output id="start-out"></output></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Volle Stärke ab</span></div>
+        <div class="row-ctl slider"><input type="range" id="full" min="1" max="255"><output id="full-out"></output></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Stärkste Abdunkelung</span></div>
+        <div class="row-ctl slider"><input type="range" id="max" min="0" max="94"><output id="max-out"></output></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Dunkler werden</span></div>
+        <div class="row-ctl"><div class="seg" id="attack"></div></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Heller werden</span></div>
+        <div class="row-ctl"><div class="seg" id="release"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Helle Flecken</h2>
+      <button class="btn subtle" data-reset="glare" type="button">Standardwerte</button>
+    </div>
+    <div class="group">
+      <div class="row">
+        <div class="row-label"><span>Modus</span><small>Lokal dunkelt nur die grelle Stelle ab</small></div>
+        <div class="row-ctl"><div class="seg" id="glare"></div></div>
+      </div>
+      <div class="local" id="glare-local">
+        <div class="row">
+          <div class="row-label"><span>Empfindlichkeit</span><small>kleiner reagiert früher</small></div>
+          <div class="row-ctl slider"><input type="range" id="glare_contrast" min="3" max="12"><output id="glare_contrast-out"></output></div>
+        </div>
+        <div class="row">
+          <div class="row-label"><span>Stärke</span></div>
+          <div class="row-ctl slider"><input type="range" id="glare_strength" min="20" max="90"><output id="glare_strength-out"></output></div>
+        </div>
+        <div class="row">
+          <div class="row-label"><span>Rand</span></div>
+          <div class="row-ctl"><div class="seg" id="glare_margin"></div></div>
+        </div>
+        <div class="row">
+          <div class="row-label"><span>Ausblenden</span></div>
+          <div class="row-ctl slider"><input type="range" id="glare_fade_ms" min="100" max="1500" step="50"><output id="glare_fade_ms-out"></output></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Blaulichtfilter</h2>
+      <div class="head-ctl">
+        <button class="btn subtle" data-reset="tint" type="button">Standardwerte</button>
+        <label class="toggle"><input type="checkbox" id="tint_on" role="switch" aria-label="Blaulichtfilter"><span class="track"></span></label>
+      </div>
+    </div>
+    <div class="group" id="tint-group">
+      <div class="row">
+        <div class="row-label"><span>Farbtemperatur</span></div>
+        <div class="row-ctl slider"><span class="swatch" id="swatch"></span><input type="range" id="kelvin" step="100"><output id="kelvin-out"></output></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Stärke</span></div>
+        <div class="row-ctl slider"><input type="range" id="strength" min="0"><output id="strength-out"></output></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Nur nachts</span><small id="night-hint"></small></div>
+        <div class="row-ctl times">
+          <input type="time" id="night_start" aria-label="von">
+          <span class="to">bis</span>
+          <input type="time" id="day_start" aria-label="bis">
+          <label class="toggle"><input type="checkbox" id="tint_night_only" role="switch" aria-label="Nur nachts"><span class="track"></span></label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Optionen</h2>
+      <button class="btn subtle" data-reset="options" type="button">Standardwerte</button>
+    </div>
+    <div class="group">
+      <div class="row">
+        <div class="row-label"><span>Messrate</span></div>
+        <div class="row-ctl"><div class="seg" id="rate"></div></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Tastenkürzel Strg+Alt+D</span><small id="hotkey-hint"></small></div>
+        <div class="row-ctl"><label class="toggle"><input type="checkbox" id="hotkey" role="switch"><span class="track"></span></label></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Beim Start pausiert</span></div>
+        <div class="row-ctl"><label class="toggle"><input type="checkbox" id="start_paused" role="switch"><span class="track"></span></label></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Schließen blendet nur aus</span></div>
+        <div class="row-ctl"><label class="toggle"><input type="checkbox" id="close_to_tray" role="switch"><span class="track"></span></label></div>
+      </div>
+      <div class="row">
+        <div class="row-label"><span>Minimiert starten</span></div>
+        <div class="row-ctl"><label class="toggle"><input type="checkbox" id="start_minimized" role="switch"><span class="track"></span></label></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <details class="log">
+      <summary>Protokoll</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+</main>
+
+<template id="monitor-tpl">
+  <article class="monitor">
+    <div class="mon-head">
+      <span class="mon-num"></span>
+      <div class="mon-name"><span class="mon-title"></span><small class="mon-meta"></small></div>
+      <label class="toggle"><input type="checkbox" role="switch"><span class="track"></span></label>
+    </div>
+    <div class="meter">
+      <div class="ramp"></div>
+      <div class="needle"></div>
+    </div>
+    <dl class="readout">
+      <div><dt>Helligkeit</dt><dd class="v-bright"></dd></div>
+      <div><dt>Abdunkelung</dt><dd class="v-dim"></dd></div>
+      <div><dt>Filter</dt><dd class="v-tint"></dd></div>
+    </dl>
+  </article>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

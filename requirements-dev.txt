@@ -1,0 +1,7 @@
+-r requirements.txt
+pytest>=8
+pytest-timeout>=2.3
+ruff>=0.6
+mypy>=1.10
+psutil>=5.9
+pyinstaller>=6.0
